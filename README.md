@@ -107,9 +107,14 @@ Thank you, every support really helps to find more time for UNanite!
 
 ## License
 
-UNanite is free and open source: **GPL-3.0** with one additional term - if you use the plugin, keep the credit
-**"UNanite by Roman Koscheev (anomal3)"** in your credits or about screen. Because of the GPL, projects built on
-UNanite must stay open source too. Details in [LICENSE.md](LICENSE.md) and [NOTICE.md](Assets/UNanite/NOTICE.md).
+UNanite is free and open source: **GPL-3.0 with a Unity exception**. You can use it in any project - free or paid,
+open or closed source, your own game code stays yours. What I ask in return:
+
+- UNanite itself and every changed version of it stays open (GPL-3.0, with the source);
+- keep the credit **"UNanite by Roman Koscheev (anomal3)"** in your credits or about screen;
+- don't present it as your own work and don't call your own version "UNanite".
+
+Details in [LICENSE.md](LICENSE.md) and [NOTICE.md](Assets/UNanite/NOTICE.md).
 
 ## Credits
 

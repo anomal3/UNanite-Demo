@@ -111,6 +111,11 @@ terrain cuts across tiles and levels, runtime edits identical to a full rebuild,
 ## License
 
 Copyright (C) 2026 Roman Koscheev (anomal3). GPL-3.0-only ([LICENSE](LICENSE)) with an additional
-attribution term (GPL v3 section 7(b)): works that contain or are based on UNanite must keep
-"UNanite by Roman Koscheev (anomal3)" in their credits / legal notices. See [NOTICE.md](NOTICE.md).
+permission for Unity and additional terms (GPL v3 section 7), see [NOTICE.md](NOTICE.md):
+
+- free for everyone, in any project, free or paid, open or closed source: your own game code and
+  assets stay yours, under your own terms;
+- UNanite itself, and every modified version of it, stays GPL-3.0 with its source available;
+- keep "UNanite by Roman Koscheev (anomal3)" in your credits or About screen;
+- don't present UNanite as your own work, and don't call your own version "UNanite".
 The native builder uses meshoptimizer (MIT).

@@ -34,9 +34,10 @@ namespace UNanite.Editor
             "If you will find a bug, please open an issue there.";
 
         const string k_License =
-            "UNanite is free and open source under the GPL-3.0 (LICENSE in the package). Projects built with it must stay " +
-            "open too and must keep the credit \"UNanite by Roman Koscheev (anomal3)\" in your credits or about screen " +
-            "(NOTICE.md).";
+            "UNanite is free and open source under the GPL-3.0 with a Unity exception (NOTICE.md in the package): use it in " +
+            "any project, free or paid, open or closed - your own code stays yours. UNanite itself and changes to it stay open, " +
+            "keep the credit \"UNanite by Roman Koscheev (anomal3)\" in your credits or about screen, and don't present it " +
+            "as your own work.";
 
         static VgWelcomeWindow()
         {
