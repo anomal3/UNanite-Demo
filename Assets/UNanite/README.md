@@ -6,6 +6,18 @@ milestone: [Documentation~/Milestones.md](Documentation~/Milestones.md). Design:
 [Documentation~/Architecture.md](Documentation~/Architecture.md). Binary layout:
 [Documentation~/DataFormat.md](Documentation~/DataFormat.md).
 
+## Install
+
+- **.unitypackage** (`UNanite_<version>.unitypackage` from the
+  [releases](https://github.com/anomal3/UNanite-Demo/releases)): installs to `Assets/UNanite`, the native
+  builder DLL comes as `Plugins/win-x64` (no platform enabled; loaded by UNanite from a shadow copy).
+- **UPM package**: Package Manager → Add package from tarball / from disk / git URL.
+
+Use one way only. Requirements: Unity 6000.4, HDRP 17.4, Windows. A welcome window opens after install
+(checkbox *Show this window at every startup*; **Tools/UNanite/Welcome**). Player builds need nothing
+extra: page files go to `StreamingAssets/UNanite`, the shader variants of the runtime material twins are
+kept by temporary twin materials (`VgShaderVariantBuildStep`), the native builder is copied to the player.
+
 ## Quick start
 
 1. Select a model or mesh asset → tick **Virtual Geometry** in the inspector header (writes a
@@ -95,3 +107,10 @@ resident sets), streamed rendering converging to the all-resident image, page fi
 import artifacts, and (M8) terrain HLOD switches (monotonic, exactly one node per path), watertight
 terrain cuts across tiles and levels, runtime edits identical to a full rebuild, terrain rendering
 (1 px cut vs full detail, edits swapped in) and mesh replacement without dropping streamed pages.
+
+## License
+
+Copyright (C) 2026 Roman Koscheev (anomal3). GPL-3.0-only ([LICENSE](LICENSE)) with an additional
+attribution term (GPL v3 section 7(b)): works that contain or are based on UNanite must keep
+"UNanite by Roman Koscheev (anomal3)" in their credits / legal notices. See [NOTICE.md](NOTICE.md).
+The native builder uses meshoptimizer (MIT).

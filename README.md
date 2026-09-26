@@ -105,7 +105,14 @@ donate USDT:
 
 Thank you, every support really helps to find more time for UNanite!
 
+## License
+
+UNanite is free and open source: **GPL-3.0** with one additional term - if you use the plugin, keep the credit
+**"UNanite by Roman Koscheev (anomal3)"** in your credits or about screen. Because of the GPL, projects built on
+UNanite must stay open source too. Details in [LICENSE.md](LICENSE.md) and [NOTICE.md](Assets/UNanite/NOTICE.md).
+
 ## Credits
 
-- The scene, the character and the sample assets are from Unity's HDRP 3D Sample template (Unity Companion License).
+- The scene, the character and the sample assets are from Unity's HDRP 3D Sample template (Unity Companion License),
+  they are not covered by the GPL.
 - The native cluster builder uses [meshoptimizer](https://github.com/zeux/meshoptimizer) (MIT).

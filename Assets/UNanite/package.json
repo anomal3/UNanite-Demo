@@ -4,12 +4,23 @@
   "version": "0.11.2-preview",
   "unity": "6000.2",
   "description": "Virtualized geometry for Unity 6 (Nanite-style cluster DAG, GPU-driven culling, visibility buffer, page streaming). Primary target HDRP 17, secondary URP 17. D3D12 first, Vulkan second.",
-  "keywords": ["virtual geometry", "nanite", "gpu driven", "lod", "hdrp"],
+  "keywords": [
+    "virtual geometry",
+    "nanite",
+    "gpu driven",
+    "lod",
+    "hdrp"
+  ],
   "dependencies": {
     "com.unity.render-pipelines.core": "17.2.0",
     "com.unity.mathematics": "1.3.2",
     "com.unity.collections": "2.5.1",
     "com.unity.burst": "1.8.19"
   },
-  "author": { "name": "UNanite" }
+  "author": {
+    "name": "Roman Koscheev (anomal3)",
+    "url": "https://github.com/anomal3/UNanite-Demo"
+  },
+  "license": "GPL-3.0-only",
+  "licensesUrl": "https://github.com/anomal3/UNanite-Demo/blob/main/Assets/UNanite/LICENSE"
 }

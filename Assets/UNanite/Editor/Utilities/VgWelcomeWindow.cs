@@ -33,6 +33,11 @@ namespace UNanite.Editor
             "with a ready Windows build. Tested only on Windows, DirectX 12 and RTX 3060, on AMD and Vulkan I didn't test it yet. " +
             "If you will find a bug, please open an issue there.";
 
+        const string k_License =
+            "UNanite is free and open source under the GPL-3.0 (LICENSE in the package). Projects built with it must stay " +
+            "open too and must keep the credit \"UNanite by Roman Koscheev (anomal3)\" in your credits or about screen " +
+            "(NOTICE.md).";
+
         static VgWelcomeWindow()
         {
             if (Application.isBatchMode)
@@ -96,6 +101,9 @@ namespace UNanite.Editor
                 GUILayout.Space(8);
                 EditorGUILayout.LabelField("Demo project", m_Head);
                 EditorGUILayout.LabelField(k_Demo, m_Body);
+                GUILayout.Space(8);
+                EditorGUILayout.LabelField("License", m_Head);
+                EditorGUILayout.LabelField(k_License, m_Body);
                 GUILayout.Space(8);
                 using (new EditorGUILayout.HorizontalScope())
                 {
