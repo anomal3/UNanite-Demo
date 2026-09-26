@@ -1,0 +1,103 @@
+// M4 hierarchical Z ("VG.BuildHZB"): farthest-depth pyramid of a camera depth buffer, stored in a
+// structured buffer. Level 0 is (power of two >= ceil(W/2)) x (power of two >= ceil(H/2)); level L
+// halves it (min 1). Texel t of level L covers exactly pixels [t * 2^(L+1), (t+1) * 2^(L+1)).
+// Pixels outside the screen count as the far plane, so they never occlude.
+// Layout: levels are consecutive, row-major (see HzbLevelOffset in VgCull.compute).
+//
+// Each 16x16 group writes 4-5 levels at once through groupshared memory (1024^2 level 0: 3
+// dispatches instead of 11):
+//   FromDepth   level 0 from 2x2 depth pixels per thread, then levels 1..4
+//   Downsample  levels S+1..S+4 from level S (_HzbLevel.x)
+// Texels outside a level (a dimension already at 1) hold the far value, exactly as a sequential
+// 2x2 reduction with out-of-range sources at the far plane.
+
+#pragma kernel FromDepth
+#pragma kernel Downsample
+
+#define TILE 16
+
+Texture2DArray<float> _VgDepth;
+RWStructuredBuffer<float> VG_HzbOut;
+
+uint4 _HzbSize;    // xy: level-0 size, zw: screen size (pixels)
+uint4 _HzbLevel;   // x: source level (Downsample), y: level count
+float4 _HzbParams; // x: far value (0 reversed Z, 1 otherwise), y: reversed Z
+
+groupshared float gs_Hzb[TILE * TILE];
+
+float Farthest(float a, float b)
+{
+    return _HzbParams.y != 0 ? min(a, b) : max(a, b);
+}
+
+uint2 LevelSize(uint level)
+{
+    return uint2(max(_HzbSize.x >> level, 1u), max(_HzbSize.y >> level, 1u));
+}
+
+uint LevelOffset(uint level)
+{
+    uint offset = 0;
+    for (uint l = 0; l < level; ++l)
+    {
+        uint2 s = LevelSize(l);
+        offset += s.x * s.y;
+    }
+    return offset;
+}
+
+float LoadDepth(uint2 p)
+{
+    if (p.x >= _HzbSize.z || p.y >= _HzbSize.w)
+        return _HzbParams.x;
+    return _VgDepth.Load(int4(p, 0, 0));
+}
+
+// gs_Hzb holds level `level` for this group's 16x16 texels at p: writes levels level+1..level+4
+void ReduceGroup(uint level, uint2 p, uint2 gtid)
+{
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint k = 1; k <= 4; ++k)
+    {
+        uint step = 1u << k;
+        uint mip = level + k;
+        if (mip < _HzbLevel.y && (gtid.x & (step - 1)) == 0 && (gtid.y & (step - 1)) == 0)
+        {
+            uint h = step >> 1;
+            uint i = gtid.y * TILE + gtid.x;
+            float m = Farthest(Farthest(gs_Hzb[i], gs_Hzb[i + h]), Farthest(gs_Hzb[i + h * TILE], gs_Hzb[i + h * TILE + h]));
+            gs_Hzb[i] = m;
+            uint2 size = LevelSize(mip);
+            uint2 o = p >> k;
+            if (o.x < size.x && o.y < size.y)
+                VG_HzbOut[LevelOffset(mip) + o.y * size.x + o.x] = m;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+[numthreads(TILE, TILE, 1)]
+void FromDepth(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint2 t = gid.xy * TILE + gtid.xy;
+    float d = _HzbParams.x;
+    if (t.x < _HzbSize.x && t.y < _HzbSize.y)
+    {
+        uint2 p = t * 2;
+        d = Farthest(Farthest(LoadDepth(p), LoadDepth(p + uint2(1, 0))), Farthest(LoadDepth(p + uint2(0, 1)), LoadDepth(p + uint2(1, 1))));
+        VG_HzbOut[t.y * _HzbSize.x + t.x] = d;
+    }
+    gs_Hzb[gtid.y * TILE + gtid.x] = d;
+    ReduceGroup(0, t, gtid.xy);
+}
+
+[numthreads(TILE, TILE, 1)]
+void Downsample(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint level = _HzbLevel.x;
+    uint2 size = LevelSize(level);
+    uint2 t = gid.xy * TILE + gtid.xy;
+    gs_Hzb[gtid.y * TILE + gtid.x] = (t.x < size.x && t.y < size.y) ? VG_HzbOut[LevelOffset(level) + t.y * size.x + t.x] : _HzbParams.x;
+    ReduceGroup(level, t, gtid.xy);
+}

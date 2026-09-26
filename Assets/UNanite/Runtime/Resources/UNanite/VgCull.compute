@@ -1,0 +1,1316 @@
+// UNanite: per-view GPU culling, LOD cut, vertex expansion (M2), visibility-buffer views (M3) and
+// two-phase HZB occlusion (M4).
+//
+//   VG.ResetView        counters / bin counters for this view
+//   VG.CullInstances    frustum (+ occlusion) test per instance, seeds the BVH roots
+//   VG.PrepareNodes     indirect args for one BVH level
+//   VG.TraverseNodes    one BVH level (ping-pong queues); leaves emit group items
+//   VG.PrepareClusters  indirect args for the cluster pass
+//   VG.CullClusters     LOD rule + frustum + backface cone (+ occlusion) per cluster, bins visible clusters
+//   VG.AllocateBins     per-bin index ranges in the frame arena + indexed indirect draw args
+//   VG.PrepareExpand    indirect args for expansion
+//   VG.Expand           decodes visible clusters into the arena vertex/index buffers
+//   VG.PrepareRaster    visibility-buffer views: procedural args of the phase-1 raster draws (M3)
+//
+// Visibility-buffer camera views (M3) keep clusters of resolve-capable bins out of the expansion:
+// they are rasterised by VgVisBufferRaster.shader / VgSwRaster.compute and shaded by the material
+// resolve. Their visible records live in the camera's own region of VG_Visible (_ViewConfig.x),
+// appended sequentially; resolve records are also referenced from three raster lists of the region
+// (VG_RasterLists, M5): 0 hardware single-sided, 1 hardware double-sided, 2 software (small clusters).
+//
+// Two-phase occlusion (M4, visibility-buffer cameras, _OccConfig.x):
+//   phase 1 (culling callback): instances, nodes and clusters are tested against the camera's
+//     previous-frame HZB; occluded items are appended to the camera's deferred lists
+//     (VG_OccludedInstances / Nodes / Clusters) instead of being dropped.
+//   phase 2 (custom pass, after the phase-1 raster and VgHzb.compute): BeginPhase2 restores the
+//     view's visible counts, CullDeferredInstances + SeedDeferredNodes restart traversal from the
+//     deferred items, CullClusters / CullDeferredClusters test against the current HZB, and
+//     FinishPhase2 writes the phase-2 raster args. Nothing is deferred in phase 2.
+// Only instances flagged VG_INSTANCE_OCCLUDABLE (every material bin resolve-capable) are tested.
+//
+// Shadow views (M6):
+//   * receiver culling (_OccConfig.x = 3): VG_Hzb holds the split's receiver pyramid (farthest
+//     light-space depth of anything the camera can see, VgShadowReceivers.compute) instead of a
+//     camera HZB; the same IsOccluded test rejects casters behind every receiver in their
+//     footprint. Every instance is tested, nothing is deferred.
+//   * vertex-pulled shadow raster (_ViewConfig.y = VG_BIN_SHADOW): records of VG_BIN_SHADOW bins go
+//     to raster lists 0 / 1 of region 0 instead of the expansion; PrepareShadowRaster reserves a
+//     range of the frame-wide VG_ShadowRecords and CompactShadow copies them there, so they
+//     survive until HDRP's shadow pass draws them with VgShadowRaster.shader.
+//
+// Streaming (M7): VG_PageOffsets holds ~0 for pages that are not resident. CullClusters renders a
+// cluster only if its group is resident, and falls back to it (instead of its refined group) when
+// the refined group is not resident, so the cut is always complete and crack-free (residency is
+// upward-closed). Every group item reports its page with its projected error (usage of resident
+// pages, requests for missing ones) into VG_PageFeedback / VG_FeedbackList; GatherFeedback compacts
+// that for the CPU readback at the end of the frame.
+//
+// The arena is a Mesh whose vertex/index buffers are written here and drawn by HDRP/URP through
+// BatchRendererGroup indirect draws (one per material bin and view), so unmodified materials
+// (HDRP/Lit, Shader Graph...) render VG geometry in every pass.
+
+#pragma kernel ResetView
+#pragma kernel CullInstances
+#pragma kernel PrepareNodes
+#pragma kernel TraverseNodes
+#pragma kernel PrepareClusters
+#pragma kernel CullClusters
+#pragma kernel AllocateBins
+#pragma kernel PrepareExpand
+#pragma kernel Expand
+#pragma kernel ResetFrame
+#pragma kernel PrepareRaster
+#pragma kernel BeginPhase2
+#pragma kernel CullDeferredInstances
+#pragma kernel SeedDeferredNodes
+#pragma kernel CullDeferredClusters
+#pragma kernel FinishPhase2
+#pragma kernel PrepareShadowRaster
+#pragma kernel CompactShadow
+#pragma kernel ClearShadowView
+#pragma kernel GatherFeedback
+#pragma kernel ResetFeedback
+#pragma kernel PrepareBatchCompact
+#pragma kernel WriteInstanceMatrices
+#pragma kernel UpdateLodFade
+
+#include "../../ShaderLibrary/VgFormat.hlsl"
+
+// ---- per-view constants ----------------------------------------------------------------------
+cbuffer VgViewConstants
+{
+    float4 _Planes[16];
+    float4 _ViewPosAndLodA;   // xyz: view position (world), w: orthographic LOD term
+    float4 _LodParams;        // x: perspective LOD term, y: near, z: flags, w: plane count
+    uint4 _Counts;            // x: instanceCount, y: binCount, z: argsBase (in draws), w: nodeQueueCapacity
+    uint4 _Capacities;        // x: groupItemCapacity, y: visibleCapacity, z: vertexCapacity, w: indexCapacity
+    uint4 _Iteration;         // x: BVH level index (ping-pong parity), y: stats slot, z: debug view mode
+    uint4 _ViewConfig;        // x: first VG_Visible record of this view, y: raster bin mask (VG_BIN_RESOLVE: visibility-buffer view, VG_BIN_SHADOW: shadow raster view, 0: expansion only), z: raster args base (uints), w: shadow record capacity
+    // M4 occlusion
+    float4x4 _OccViewProj;    // world -> clip of the frame the bound HZB was built from (HDRP GPU projection, unjittered)
+    float4 _OccScreen;        // xy: screen size in pixels of that frame
+    uint4 _OccConfig;         // x: 0 off, 1 phase 1 (test + defer), 2 phase 2 (test only), 3 shadow receivers (test only, M6); y: phase state base; z: deferred list base (receivers: first VG_Hzb texel of the split); w: deferred list capacity
+    uint4 _OccHzb;            // xy: HZB level-0 size (texels, power of two), z: level count, w: reversed Z
+    // M5 software raster classification
+    float4 _SwParams;         // x: pixels per world unit at distance 1 (perspective), y: pixels per unit (orthographic), z: threshold diameter (px), w: enabled
+    uint4 _ListConfig;        // x: first entry of this region's raster lists in VG_RasterLists, y: list capacity
+    // M7 streaming
+    uint4 _StreamingConfig;   // x: page feedback on, y: feedback list capacity
+    // shadow views: never finer than the owner camera needs (xyz camera position, w perspective LOD term, 0 = off)
+    float4 _LodCamera;
+    // M9 follow-up, batched shadow splits: x split count (0: single view, the constants above), y visible
+    // records per split, z raster-list capacity per split, w bin capacity (per-split bin counters)
+    uint4 _Batch;
+    // M11 animated LOD crossfade: x first state of the camera's slot (-1: none), y switch record count, z time (float bits)
+    int4 _LodFade;
+};
+
+#define DEBUG_NONE 0
+#define DEBUG_TRIANGLES 1
+#define DEBUG_CLUSTERS 2
+#define DEBUG_GROUPS 3
+#define DEBUG_LOD 4
+#define DEBUG_INSTANCES 5
+#define DEBUG_MATERIALS 6
+
+// Id written into the vertex colour for the debug view (see VgDebugBRG.shader).
+uint DebugId(uint mode, uint4 vis, VgCluster c, VgMeshGpu mesh)
+{
+    switch (mode)
+    {
+        case DEBUG_TRIANGLES:
+        case DEBUG_CLUSTERS: return vis.y * 131u + vis.z * 7919u; // page address + cluster in page
+        case DEBUG_GROUPS: return mesh.groupBase + c.group;
+        case DEBUG_LOD: return c.lodLevel;
+        case DEBUG_INSTANCES: return vis.x;
+        default: return vis.w;
+    }
+}
+
+#define VIEW_FLAG_SHADOW 1u
+#define VIEW_FLAG_NO_CONE 2u
+
+#define VG_INSTANCE_OCCLUDABLE 8u
+
+// counters (uint offsets)
+#define C_QUEUE0 0
+#define C_QUEUE1 1
+#define C_GROUPS 2
+#define C_VISIBLE 3
+#define C_DISPATCH_NODES 4      // 3 uints
+#define C_DISPATCH_CLUSTERS 8   // 3 uints
+#define C_DISPATCH_EXPAND 12    // 3 uints
+#define C_OVERFLOW 16           // bit0 node queue, bit1 group items, bit2 visible, bit3 vertices, bit4 indices
+#define C_TRIANGLES 17
+#define C_INSTANCES 18
+#define C_LIST0 19              // raster list sizes (M5): hardware single-sided
+#define C_LIST1 20              //   hardware double-sided
+#define C_LIST2 21              //   software
+#define C_RECEIVER 22           // M6: instances / nodes / clusters rejected by receiver culling
+#define C_LIST3 23              // expansion list: records of bins this view expands (Expand's work)
+#define C_DISPATCH_DEFERRED_NODES 24     // 3 uints (phase 2)
+#define C_DISPATCH_DEFERRED_CLUSTERS 28  // 3 uints (phase 2)
+#define C_SHADOW_TRIS 32        // M6: 2 uints, triangles of shadow raster lists 0 / 1
+#define C_SHADOW_CURSOR 34      // M6: 2 uints, index write cursors of the lists
+#define C_COUNT 40
+#define C_DISPATCH_BATCH 36     // batched splits: 3 uints, CompactShadow over all splits (split 0 block)
+
+// phase state (per visibility-buffer camera region, 16 uints at _OccConfig.y)
+#define P_DEFERRED_INSTANCES 0
+#define P_DEFERRED_NODES 1
+#define P_DEFERRED_CLUSTERS 2
+#define P_PHASE1_VISIBLE 3      // visible records after phase 1
+#define P_PHASE1_LIST 4         // 3 uints: raster list sizes after phase 1
+#define P_PHASE2_LIST 7         // 3 uints: entries added by phase 2
+
+#define STATS_PER_VIEW 16
+
+// Per-split view data of a batch (VgWorld.Shadows.cs, RecordBatch). Work items carry the split in
+// bits 28-30 of their instance index; g_Split is the split of the item a thread works on.
+struct VgSplitView
+{
+    float4 planes[16];
+    float4 viewPosLodA;
+    float4 lodParams;    // x perspective LOD term, y near, z flags, w plane count
+    float4 lodCamera;
+    float4 occRows[4];   // light view-projection rows (receiver pyramid)
+    uint4 config;        // x receiver pyramid base (VG_Hzb), y stats / shadow-view slot, z raster args base (uints), w draw args base (draws)
+};
+StructuredBuffer<VgSplitView> VG_SplitViews;
+static uint g_Split = 0;
+
+#define VG_SPLIT_SHIFT 28u
+#define VG_SPLIT_BITS 0x70000000u
+#define VG_INSTANCE_BITS 0x0FFFFFFFu
+
+bool Batched() { return _Batch.x != 0; }
+float4 ViewPlane(uint i) { return Batched() ? VG_SplitViews[g_Split].planes[i] : _Planes[i]; }
+float4 ViewPosLodA() { return Batched() ? VG_SplitViews[g_Split].viewPosLodA : _ViewPosAndLodA; }
+float4 ViewLodParams() { return Batched() ? VG_SplitViews[g_Split].lodParams : _LodParams; }
+float4 ViewLodCamera() { return Batched() ? VG_SplitViews[g_Split].lodCamera : _LodCamera; }
+uint OccBase() { return Batched() ? VG_SplitViews[g_Split].config.x : _OccConfig.z; }
+uint StatsSlot() { return Batched() ? VG_SplitViews[g_Split].config.y : _Iteration.y; }
+uint RasterArgsBase() { return Batched() ? VG_SplitViews[g_Split].config.z : _ViewConfig.z; }
+uint DrawArgsBase() { return Batched() ? VG_SplitViews[g_Split].config.w : _Counts.z; }
+uint RecordBase() { return _ViewConfig.x + (Batched() ? g_Split * _Batch.y : 0); }
+uint RecordCapacity() { return Batched() ? _Batch.y : _Capacities.y; }
+uint ListCapacity() { return Batched() ? _Batch.z : _ListConfig.y; }
+uint ListIndex(uint list, uint slot) { return _ListConfig.x + (Batched() ? (g_Split * 4 + list) * _Batch.z : list * _ListConfig.y) + slot; }
+uint Ctr(uint c) { return c + g_Split * C_COUNT; }     // per-split counters (the shared traversal uses split 0's)
+uint BinSlot(uint b) { return b + g_Split * _Batch.w; } // per-split bin triangle counts / cursors
+
+float4 OccClip(float3 p)
+{
+    if (!Batched())
+        return mul(_OccViewProj, float4(p, 1.0));
+    VgSplitView v = VG_SplitViews[g_Split];
+    float4 q = float4(p, 1.0);
+    return float4(dot(v.occRows[0], q), dot(v.occRows[1], q), dot(v.occRows[2], q), dot(v.occRows[3], q));
+}
+
+// arena counters
+#define A_VERTICES 0
+#define A_INDICES 1
+#define A_SHADOW_RECORDS 2      // M6: VG_ShadowRecords used this frame
+
+StructuredBuffer<VgMeshGpu> VG_Meshes;
+StructuredBuffer<VgGroup> VG_Groups;
+StructuredBuffer<VgNode> VG_Nodes;
+StructuredBuffer<uint> VG_PageOffsets;
+ByteAddressBuffer VG_PagePool;
+StructuredBuffer<VgInstanceGpu> VG_Instances;
+StructuredBuffer<uint> VG_InstanceBins;
+StructuredBuffer<uint> VG_BinFlags;           // VG_BIN_* per material bin
+
+RWStructuredBuffer<uint> VG_Counters;
+RWStructuredBuffer<uint> VG_ArenaCounters;
+RWStructuredBuffer<uint2> VG_NodeQueue0;
+RWStructuredBuffer<uint2> VG_NodeQueue1;
+RWStructuredBuffer<uint2> VG_GroupItems;      // (instance, global group)
+RWStructuredBuffer<uint4> VG_Visible;         // (instance, page address, cluster in page, bin)
+RWStructuredBuffer<uint> VG_BinTriangles;     // per bin
+RWStructuredBuffer<uint> VG_BinCursor;        // per bin
+RWStructuredBuffer<uint> VG_DrawArgs;         // IndirectDrawIndexedArgs (5 uints) per (view, bin)
+RWStructuredBuffer<uint> VG_Stats;            // per stats slot: STATS_PER_VIEW uints
+RWByteAddressBuffer VG_ArenaVertices;         // 48-byte vertices (see VgArena.cs)
+RWByteAddressBuffer VG_ArenaIndices;          // uint32
+RWStructuredBuffer<uint> VG_TriangleIds;       // M11: visibility ID per arena triangle of programmable bins (VgVisRaster.hlsl)
+RWStructuredBuffer<uint> VG_RasterArgs;       // per view slot 16 uints: IndirectDrawArgs phase 1 (single, double), phase 2 (single, double)
+StructuredBuffer<float> VG_Hzb;               // min-depth pyramid (VgHzb.compute)
+RWStructuredBuffer<uint> VG_PhaseState;       // 16 uints per camera region (P_*)
+RWStructuredBuffer<uint> VG_OccludedInstances;
+RWStructuredBuffer<uint2> VG_OccludedNodes;    // (instance, node)
+RWStructuredBuffer<uint4> VG_OccludedClusters; // visible-record layout
+RWStructuredBuffer<uint> VG_RasterLists;       // M5: absolute VG_Visible record indices, 4 lists per region (region 0: shadow views; 3: expansion)
+RWStructuredBuffer<uint4> VG_ShadowRecords;    // M6: visible records of shadow-raster views, frame-wide
+RWStructuredBuffer<uint4> VG_ShadowViews;      // M6: per view slot (first record, single-sided records, double-sided records, first index)
+// M7 feedback (one buffer, CullClusters is at the 8-UAV limit of SM 5.0): [0] list count,
+// [1, 1 + capacity) pages whose feedback word left 0 this frame, then per global page the max
+// priority (float bits) reported this frame (0 = none) at 1 + capacity + page
+RWStructuredBuffer<uint> VG_Feedback;
+RWStructuredBuffer<uint> VG_FeedbackOut;       // M7: [0] count (bit31 overflow), then (page, priority bits) pairs for the readback
+StructuredBuffer<uint2> VG_GroupItemsIn;       // VG_GroupItems read-only (CullClusters: UAV limit)
+StructuredBuffer<uint4> VG_VisibleIn;          // VG_Visible read-only (Expand: UAV limit, M11)
+StructuredBuffer<uint> VG_RasterListsIn;      // VG_RasterLists read-only (Expand: UAV limit)
+StructuredBuffer<VgLodSwitch> VG_LodSwitches;  // M8 HLOD switch records (VgWorld.Hlod.cs)
+RWStructuredBuffer<uint2> VG_LodFadeState;     // M11: per camera slot and record (side | initialised << 1, switch time)
+StructuredBuffer<uint2> VG_LodFadeStateIn;     // the same, read-only (CullInstances)
+
+// ---- helpers ---------------------------------------------------------------------------------
+
+bool SphereInFrustum(float3 c, float r)
+{
+    uint count = (uint)ViewLodParams().w;
+    for (uint i = 0; i < count; ++i)
+    {
+        float4 plane = ViewPlane(i);
+        if (dot(plane.xyz, c) + plane.w < -r)
+            return false;
+    }
+    return true;
+}
+
+// Projected error in "threshold units": <= 1 means the simplified version is good enough.
+float ProjectedError(float3 worldCenter, float worldRadius, float worldError)
+{
+    float4 view = ViewPosLodA();
+    float4 lod = ViewLodParams();
+    float d = max(distance(worldCenter, view.xyz) - worldRadius, lod.y);
+    float e = worldError * (view.w + lod.x / d);
+    float4 cam = ViewLodCamera();
+    if (cam.w > 0)
+    {
+        // the coarser of the shadow-texel and the camera-pixel LOD (VirtualGeometrySettings.shadowCameraLod)
+        float dc = max(distance(worldCenter, cam.xyz) - worldRadius, 1e-3);
+        e = min(e, worldError * cam.w / dc);
+    }
+    return e;
+}
+
+// bounds / error scale of the instance's object space (M11: times its density-LOD scale)
+float InstanceScale(VgInstanceGpu inst)
+{
+    return (inst.flags & VG_INSTANCE_DENSITY_LOD) ? inst.maxScale * VgDensityLodScale(inst) : inst.maxScale;
+}
+
+bool Coarsen(VgInstanceGpu inst, VgGroup g)
+{
+    if (g.error >= VG_FLT_MAX)
+        return false;
+    float3 c = VgTransformPoint(inst, g.center);
+    return ProjectedError(c, g.radius * InstanceScale(inst), g.error * InstanceScale(inst) * inst.errorScale) <= 1.0;
+}
+
+void SetOverflow(uint bit)
+{
+    InterlockedOr(VG_Counters[Ctr(C_OVERFLOW)], bit);
+    // also into the view's stats: Expand / phase 2 run after AllocateBins wrote them
+    InterlockedOr(VG_Stats[StatsSlot() * STATS_PER_VIEW + 4], bit);
+}
+
+void WriteDispatch(uint offset, uint groups, uint z)
+{
+    // 2D dispatch to stay under the 65535 per-dimension limit (z: splits of a batch)
+    uint x = min(groups, 65535u);
+    uint y = groups == 0 ? 0 : (groups + 65534u) / 65535u;
+    VG_Counters[offset + 0] = x;
+    VG_Counters[offset + 1] = y;
+    VG_Counters[offset + 2] = z;
+}
+
+void WriteDispatch(uint offset, uint groups)
+{
+    WriteDispatch(offset, groups, 1);
+}
+
+uint LinearGroup(uint3 gid)
+{
+    return gid.y * 65535u + gid.x;
+}
+
+// ---- HZB occlusion (M4) ----------------------------------------------------------------------
+
+uint HzbLevelOffset(uint level)
+{
+    uint offset = 0;
+    for (uint l = 0; l < level; ++l)
+        offset += max(_OccHzb.x >> l, 1u) * max(_OccHzb.y >> l, 1u);
+    return offset;
+}
+
+// True when the world sphere is certainly behind the depth stored in VG_Hzb. Conservative: bounds
+// crossing the near plane or leaving the screen are visible (the frustum test owns them).
+bool IsOccluded(float3 center, float radius)
+{
+    bool reversedZ = _OccHzb.w != 0;
+    float2 ndcMin = 1e30;
+    float2 ndcMax = -1e30;
+    float nearest = reversedZ ? 0.0 : 1e30;
+    [unroll]
+    for (uint i = 0; i < 8; ++i)
+    {
+        float3 corner = center + radius * float3((i & 1) ? 1.0 : -1.0, (i & 2) ? 1.0 : -1.0, (i & 4) ? 1.0 : -1.0);
+        float4 clip = OccClip(corner);
+        if (clip.w <= 1e-5)
+            return false;
+        float3 ndc = clip.xyz / clip.w;
+        ndcMin = min(ndcMin, ndc.xy);
+        ndcMax = max(ndcMax, ndc.xy);
+        nearest = reversedZ ? max(nearest, ndc.z) : min(nearest, ndc.z);
+    }
+
+    // D3D-style viewport (y down); the projection already carries HDRP's render-to-texture flip.
+    // One extra pixel on each side covers TAA jitter between the HZB and this test.
+    float2 screen = _OccScreen.xy;
+    float2 pMin = float2(ndcMin.x * 0.5 + 0.5, 0.5 - ndcMax.y * 0.5) * screen - 1.0;
+    float2 pMax = float2(ndcMax.x * 0.5 + 0.5, 0.5 - ndcMin.y * 0.5) * screen + 1.0;
+    bool receivers = _OccConfig.x == 3;
+    if (pMin.x < 0 || pMin.y < 0 || pMax.x >= screen.x || pMax.y >= screen.y)
+    {
+        if (!receivers)
+            return false; // touches the screen border: HZB has no information outside
+        // shadow maps: only the part inside the split can shadow anything
+        pMin = max(pMin, 0.0);
+        pMax = min(pMax, screen - 1.0);
+        if (pMin.x > pMax.x || pMin.y > pMax.y)
+            return false; // outside: the frustum test owns it
+    }
+    uint2 a = (uint2)pMin;
+    uint2 b = (uint2)pMax;
+    uint size = max(b.x - a.x, b.y - a.y) + 1;
+    // level L texels cover 2^(L+1) pixels: pick the level where the rect spans <= 2 texels per axis
+    uint level = size <= 2 ? 0 : (uint)firstbithigh(size - 1);
+    level = min(level, _OccHzb.z - 1);
+    uint width = max(_OccHzb.x >> level, 1u);
+    uint height = max(_OccHzb.y >> level, 1u);
+    uint2 ta = min(a >> (level + 1), uint2(width, height) - 1);
+    uint2 tb = min(b >> (level + 1), uint2(width, height) - 1);
+    uint offset = HzbLevelOffset(level) + (receivers ? OccBase() : 0); // receiver batches: split base
+
+    // receiver pyramids hold light-space NDC depth; empty texels are -3e38 (no receiver)
+    float farthest = receivers ? -3e38 : (reversedZ ? 1.0 : 0.0);
+    for (uint y = ta.y; y <= tb.y; ++y)
+    {
+        for (uint x = ta.x; x <= tb.x; ++x)
+        {
+            float d = VG_Hzb[offset + y * width + x];
+            farthest = reversedZ ? min(farthest, d) : max(farthest, d);
+        }
+    }
+    return reversedZ ? nearest < farthest : nearest > farthest;
+}
+
+bool OcclusionTested(VgInstanceGpu inst)
+{
+    return _OccConfig.x == 3 || (_OccConfig.x != 0 && (inst.flags & VG_INSTANCE_OCCLUDABLE) != 0);
+}
+
+// Appends to a deferred list. Returns false when the list is full: the caller then treats the item
+// as visible, so overflow costs performance, never geometry.
+bool DeferItem(uint counter, out uint at)
+{
+    InterlockedAdd(VG_PhaseState[_OccConfig.y + counter], 1, at);
+    return at < _OccConfig.w;
+}
+
+// M5: small clusters entirely in front of the near plane are rasterised in software.
+bool UseSoftwareRaster(float3 center, float radius)
+{
+    if (_SwParams.w == 0)
+        return false;
+    float dist = distance(center, ViewPosLodA().xyz);
+    if (dist - radius <= ViewLodParams().y * 2.0)
+        return false; // may cross the near plane: the software raster does not clip
+    float pixelsPerUnit = _SwParams.y + _SwParams.x / dist;
+    return 2.0 * radius * pixelsPerUnit < _SwParams.z;
+}
+
+// Appends a visible cluster record to this view's region of VG_Visible (and, for bins rasterised by
+// the view - resolve bins of visibility-buffer views, shadow bins of shadow-raster views - to one of
+// the region's raster lists instead of the expansion).
+// M11: bins of programmable materials are rasterised in visibility-buffer views by their own
+// VgVisBuffer pass (indices written by Expand), not by the global raster lists
+bool ProgrammableInVisView(uint binFlags)
+{
+    return (binFlags & VG_BIN_PROGRAMMABLE) != 0 && _ViewConfig.y == VG_BIN_RESOLVE;
+}
+
+void AppendVisible(uint4 record, uint binFlags, uint triangleCount, bool software)
+{
+    bool resolve = (binFlags & _ViewConfig.y) != 0 && !ProgrammableInVisView(binFlags);
+
+    uint at;
+    InterlockedAdd(VG_Counters[Ctr(C_VISIBLE)], 1, at);
+    if (at >= RecordCapacity())
+    {
+        SetOverflow(4);
+        return;
+    }
+    VG_Visible[RecordBase() + at] = record;
+    if (resolve)
+    {
+        uint list = software ? 2 : ((binFlags & VG_BIN_DOUBLE_SIDED) != 0 ? 1 : 0);
+        uint slot;
+        InterlockedAdd(VG_Counters[Ctr(C_LIST0 + list)], 1, slot);
+        VG_RasterLists[ListIndex(list, slot)] = RecordBase() + at;
+        if (list < 2)
+            InterlockedAdd(VG_Counters[Ctr(C_SHADOW_TRIS + list)], triangleCount); // M6 index ranges
+    }
+    else
+    {
+        InterlockedAdd(VG_BinTriangles[BinSlot(record.w)], triangleCount);
+        // Expand runs over this list only, not over every visible record of the view
+        uint slot;
+        InterlockedAdd(VG_Counters[Ctr(C_LIST3)], 1, slot);
+        VG_RasterLists[ListIndex(3, slot)] = RecordBase() + at;
+    }
+    InterlockedAdd(VG_Counters[Ctr(C_TRIANGLES)], triangleCount);
+}
+
+// M8 HLOD: true when the record's error projects to at most one threshold unit over its sphere.
+bool CoarsenSwitch(uint id, float threshold)
+{
+    VgLodSwitch s = VG_LodSwitches[id];
+    return s.error < VG_FLT_MAX && ProjectedError(s.sphere.xyz, s.sphere.w, s.error) <= threshold;
+}
+
+bool CoarsenSwitch(uint id)
+{
+    return CoarsenSwitch(id, 1.0);
+}
+
+// M11 LOD crossfade of camera views (VgLodSwitch.fadeDuration / fadeStart; VgVisRaster.hlsl dithers
+// both sides): which sides of a record the camera draws. Animated: the side it last switched to, and
+// the other one while that switch is younger than fadeDuration. Band: the coarse side from fadeStart on,
+// the fine side up to the switch.
+bool FadeState(uint id, out uint2 state)
+{
+    state = 0;
+    if (_LodFade.x < 0 || VG_LodSwitches[id].fadeDuration <= 0.0)
+        return false;
+    state = VG_LodFadeStateIn[(uint)_LodFade.x + id];
+    return (state.x & 2u) != 0;
+}
+
+bool InFade(uint id, uint2 state)
+{
+    return asfloat((uint)_LodFade.z) - asfloat(state.y) < VG_LodSwitches[id].fadeDuration;
+}
+
+bool FineSideDrawn(uint id, bool camera)
+{
+    uint2 state;
+    if (camera && FadeState(id, state))
+        return (state.x & 1u) == 0 || InFade(id, state);
+    return !CoarsenSwitch(id);
+}
+
+bool CoarseSideDrawn(uint id, bool camera)
+{
+    uint2 state;
+    if (camera && FadeState(id, state))
+        return (state.x & 1u) != 0 || InFade(id, state);
+    VgLodSwitch s = VG_LodSwitches[id];
+    if (camera && s.fadeStart > 0.0 && s.fadeStart < s.error)
+        return CoarsenSwitch(id, s.error / s.fadeStart);
+    return CoarsenSwitch(id);
+}
+
+// M8 HLOD prefetch: queue items of an instance that is not drawn yet but whose parent switches to it
+// within a factor of 2 of the switch error carry this bit in their instance index. They are traversed
+// and their groups selected like drawn ones, but only to report page feedback (CullClusters): the
+// children's pages are resident when the switch happens instead of their root pages showing for a
+// few frames (root clusters of terrain tiles are fans to the locked border: a visible pop).
+#define VG_PREFETCH_BIT 0x80000000u
+
+void ProcessInstance(uint i)
+{
+    VgInstanceGpu inst = VG_Instances[i];
+    if ((inst.flags & VG_INSTANCE_ENABLED) == 0)
+        return;
+    uint viewFlags = (uint)ViewLodParams().z;
+    if ((viewFlags & VIEW_FLAG_SHADOW) && (inst.flags & VG_INSTANCE_SHADOWS) == 0)
+        return;
+    // HLOD: drawn iff the parent is not coarse enough and this node is (same record as the parent tests)
+    uint prefetch = 0;
+    bool cameraView = (viewFlags & VIEW_FLAG_SHADOW) == 0;
+    if (inst.lodParent != VG_INVALID && !FineSideDrawn(inst.lodParent, cameraView))
+    {
+        // camera views with streaming, phase 1 only: prefetch the pages of a node about to be drawn
+        bool camera = (viewFlags & VIEW_FLAG_SHADOW) == 0 && _OccConfig.x <= 1 && _StreamingConfig.x != 0;
+        if (!camera || CoarsenSwitch(inst.lodParent, 0.5))
+            return;
+        prefetch = VG_PREFETCH_BIT;
+    }
+    if (inst.lodSelf != VG_INVALID && !CoarseSideDrawn(inst.lodSelf, cameraView))
+        return;
+    float4 sphere = inst.worldSphere;
+    if (inst.flags & VG_INSTANCE_DENSITY_LOD)
+    {
+        // M11 density LOD: thinned out, or scaled about its pivot
+        float scale = VgDensityLodScale(inst);
+        if (scale <= 0.0)
+            return;
+        float3 pivot = float3(inst.localToWorld0.w, inst.localToWorld1.w, inst.localToWorld2.w);
+        sphere = float4(pivot + (sphere.xyz - pivot) * scale, sphere.w * scale);
+    }
+    if (!SphereInFrustum(sphere.xyz, sphere.w))
+        return;
+
+    if (prefetch == 0 && OcclusionTested(inst) && IsOccluded(sphere.xyz, sphere.w))
+    {
+        if (_OccConfig.x >= 2)
+        {
+            if (_OccConfig.x == 3)
+                InterlockedAdd(VG_Counters[Ctr(C_RECEIVER)], 1);
+            return;
+        }
+        uint slot;
+        if (DeferItem(P_DEFERRED_INSTANCES, slot))
+        {
+            VG_OccludedInstances[_OccConfig.z + slot] = i;
+            return;
+        }
+    }
+
+    if (prefetch == 0)
+        InterlockedAdd(VG_Counters[Ctr(C_INSTANCES)], 1);
+
+    VgMeshGpu mesh = VG_Meshes[inst.meshIndex];
+    uint at;
+    InterlockedAdd(VG_Counters[C_QUEUE0], mesh.rootNodeCount, at);
+    if (at + mesh.rootNodeCount > _Counts.w)
+    {
+        SetOverflow(1);
+        return;
+    }
+    for (uint r = 0; r < mesh.rootNodeCount; ++r)
+        VG_NodeQueue0[at + r] = uint2(i | prefetch | (g_Split << VG_SPLIT_SHIFT), mesh.nodeBase + r);
+}
+
+// ---- kernels ---------------------------------------------------------------------------------
+
+// M11 animated LOD crossfade: this camera's side of every fading record; a switch starts a fade (a
+// switch back during a fade continues from the mirrored progress, so nothing jumps)
+[numthreads(64, 1, 1)]
+void UpdateLodFade(uint3 id : SV_DispatchThreadID)
+{
+    if (_LodFade.x < 0 || id.x >= (uint)_LodFade.y)
+        return;
+    VgLodSwitch s = VG_LodSwitches[id.x];
+    if (s.fadeDuration <= 0.0)
+        return;
+    uint coarse = CoarsenSwitch(id.x) ? 1u : 0u;
+    uint at = (uint)_LodFade.x + id.x;
+    uint2 state = VG_LodFadeState[at];
+    float now = asfloat((uint)_LodFade.z);
+    if ((state.x & 2u) == 0)
+        VG_LodFadeState[at] = uint2(coarse | 2u, asuint(now - s.fadeDuration)); // first sight: no fade
+    else if ((state.x & 1u) != coarse)
+    {
+        float t = saturate((now - asfloat(state.y)) / s.fadeDuration);
+        VG_LodFadeState[at] = uint2(coarse | 2u, asuint(now - (1.0 - t) * s.fadeDuration));
+    }
+}
+
+[numthreads(1, 1, 1)]
+void ResetFrame(uint3 id : SV_DispatchThreadID)
+{
+    VG_ArenaCounters[A_VERTICES] = 0;
+    VG_ArenaCounters[A_INDICES] = 0;
+    VG_ArenaCounters[A_SHADOW_RECORDS] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void ResetView(uint3 id : SV_DispatchThreadID)
+{
+    uint splits = max(_Batch.x, 1u);
+    for (uint c = id.x; c < C_COUNT * splits; c += 64)
+        VG_Counters[c] = 0;
+    if (_OccConfig.x == 1 && id.x < 16)
+        VG_PhaseState[_OccConfig.y + id.x] = 0;
+    for (uint s = 0; s < splits; ++s)
+    {
+        for (uint b = id.x; b < _Counts.y; b += 64)
+        {
+            VG_BinTriangles[b + s * _Batch.w] = 0;
+            VG_BinCursor[b + s * _Batch.w] = 0;
+        }
+    }
+}
+
+[numthreads(64, 1, 1)]
+void CullInstances(uint3 id : SV_DispatchThreadID)
+{
+    g_Split = id.y; // batched splits: one row of groups per split
+    if (id.x < _Counts.x)
+        ProcessInstance(id.x);
+}
+
+[numthreads(1, 1, 1)]
+void PrepareNodes(uint3 id : SV_DispatchThreadID)
+{
+    uint parity = _Iteration.x & 1;
+    uint inCount = min(VG_Counters[parity ? C_QUEUE1 : C_QUEUE0], _Counts.w);
+    WriteDispatch(C_DISPATCH_NODES, (inCount + 63) / 64);
+    VG_Counters[parity ? C_QUEUE0 : C_QUEUE1] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void TraverseNodes(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint parity = _Iteration.x & 1;
+    uint inCount = min(VG_Counters[parity ? C_QUEUE1 : C_QUEUE0], _Counts.w);
+    uint item = LinearGroup(gid) * 64 + gi;
+    if (item >= inCount)
+        return;
+
+    uint2 work = parity ? VG_NodeQueue1[item] : VG_NodeQueue0[item];
+    bool prefetch = (work.x & VG_PREFETCH_BIT) != 0;
+    g_Split = (work.x & VG_SPLIT_BITS) >> VG_SPLIT_SHIFT;
+    VgInstanceGpu inst = VG_Instances[work.x & VG_INSTANCE_BITS];
+    VgMeshGpu mesh = VG_Meshes[inst.meshIndex];
+    VgNode node = VG_Nodes[work.y];
+    if (node.childCount == 0 && node.group < 0)
+        return; // empty level root
+
+    float3 c = VgTransformPoint(inst, node.center);
+    float r = node.radius * InstanceScale(inst);
+    if (!SphereInFrustum(c, r))
+        return;
+
+    // every group in the subtree is coarsened -> nothing in it renders
+    if (node.error < VG_FLT_MAX && ProjectedError(c, r, node.error * InstanceScale(inst) * inst.errorScale) <= 1.0)
+        return;
+
+    if (!prefetch && OcclusionTested(inst) && IsOccluded(c, r))
+    {
+        if (_OccConfig.x >= 2)
+        {
+            if (_OccConfig.x == 3)
+                InterlockedAdd(VG_Counters[Ctr(C_RECEIVER)], 1);
+            return;
+        }
+        uint slot;
+        if (DeferItem(P_DEFERRED_NODES, slot))
+        {
+            VG_OccludedNodes[_OccConfig.z + slot] = work;
+            return;
+        }
+    }
+
+    if (node.group >= 0)
+    {
+        uint at;
+        InterlockedAdd(VG_Counters[C_GROUPS], 1, at);
+        if (at >= _Capacities.x)
+        {
+            SetOverflow(2);
+            return;
+        }
+        VG_GroupItems[at] = uint2(work.x, mesh.groupBase + (uint)node.group);
+        return;
+    }
+
+    uint at;
+    InterlockedAdd(VG_Counters[parity ? C_QUEUE0 : C_QUEUE1], node.childCount, at);
+    if (at + node.childCount > _Counts.w)
+    {
+        SetOverflow(1);
+        return;
+    }
+    for (uint k = 0; k < node.childCount; ++k)
+    {
+        uint2 child = uint2(work.x, mesh.nodeBase + node.childOffset + k);
+        if (parity)
+            VG_NodeQueue0[at + k] = child;
+        else
+            VG_NodeQueue1[at + k] = child;
+    }
+}
+
+[numthreads(1, 1, 1)]
+void PrepareClusters(uint3 id : SV_DispatchThreadID)
+{
+    WriteDispatch(C_DISPATCH_CLUSTERS, min(VG_Counters[C_GROUPS], _Capacities.x));
+}
+
+// M7: reports that `page` is wanted (a request when missing, a use when resident) with `priority`
+// (projected error). The first report of a page in the frame appends it to the list; on overflow
+// the word is reset so the page can be reported again next frame.
+void PageFeedback(uint page, float priority)
+{
+    if (_StreamingConfig.x == 0)
+        return;
+    uint word = 1 + _StreamingConfig.y + page;
+    uint previous;
+    InterlockedMax(VG_Feedback[word], asuint(clamp(priority, 1e-6, 1e30)), previous);
+    if (previous != 0)
+        return;
+    uint at;
+    InterlockedAdd(VG_Feedback[0], 1, at);
+    if (at < _StreamingConfig.y)
+        VG_Feedback[1 + at] = page;
+    else
+        VG_Feedback[word] = 0;
+}
+
+// one thread group per group item, one thread per cluster (groups have <= 32 clusters)
+[numthreads(32, 1, 1)]
+void CullClusters(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint item = LinearGroup(gid);
+    if (item >= min(VG_Counters[C_GROUPS], _Capacities.x))
+        return;
+
+    uint2 work = VG_GroupItemsIn[item];
+    bool prefetch = (work.x & VG_PREFETCH_BIT) != 0;
+    g_Split = (work.x & VG_SPLIT_BITS) >> VG_SPLIT_SHIFT;
+    work.x &= VG_INSTANCE_BITS;
+    VgInstanceGpu inst = VG_Instances[work.x];
+    VgMeshGpu mesh = VG_Meshes[inst.meshIndex];
+    VgGroup group = VG_Groups[work.y];
+
+    uint page = mesh.pageBase + group.pageIndex;
+    uint pageAddress = VG_PageOffsets[page];
+    if (gi == 0)
+    {
+        // the group is not coarsened (traversal emits only those): its page is needed
+        float priority = 1e30;
+        if (group.error < VG_FLT_MAX)
+            priority = ProjectedError(VgTransformPoint(inst, group.center), group.radius * InstanceScale(inst), group.error * InstanceScale(inst) * inst.errorScale);
+        PageFeedback(page, priority);
+    }
+    if (prefetch)
+        return;
+
+    // groups are emitted only when not coarsened; still recheck cheaply for robustness
+    if (gi >= group.clusterCount || pageAddress == VG_INVALID)
+        return;
+
+    uint clusterInPage = group.pageClusterOffset + gi;
+    VgCluster c = VgLoadCluster(VG_PagePool, pageAddress, clusterInPage);
+
+    // LOD: render if source cluster, or the group it was simplified from is coarsened or not resident
+    if (c.refinedGroup != VG_INVALID)
+    {
+        VgGroup refined = VG_Groups[mesh.groupBase + c.refinedGroup];
+        if (!Coarsen(inst, refined) && VG_PageOffsets[mesh.pageBase + refined.pageIndex] != VG_INVALID)
+            return;
+    }
+
+    float3 center = VgTransformPoint(inst, c.cullCenter);
+    float radius = c.cullRadius * InstanceScale(inst);
+    if (!SphereInFrustum(center, radius))
+        return;
+
+    uint bin = VG_InstanceBins[inst.materialBase + c.material];
+    if (bin == VG_INVALID)
+        return; // a submesh without a material slot (not drawn, as with MeshRenderer)
+    uint binFlags = VG_BinFlags[bin];
+
+    // back-face cone culling is only valid for single-sided materials
+    uint viewFlags = (uint)ViewLodParams().z;
+    if ((viewFlags & VIEW_FLAG_NO_CONE) == 0 && (binFlags & VG_BIN_DOUBLE_SIDED) == 0)
+    {
+        int4 s8 = int4(c.cone << 24, c.cone << 16, c.cone << 8, c.cone) >> 24;
+        float cutoff = s8.w / 127.0;
+        if (cutoff < 1.0)
+        {
+            float3 axis = normalize(VgTransformNormal(inst, float3(s8.xyz) / 127.0));
+            float3 toCenter = center - ViewPosLodA().xyz;
+            float dist = length(toCenter);
+            if (dist > radius && dot(toCenter, axis) >= cutoff * dist + radius)
+                return;
+        }
+    }
+
+    uint4 record = uint4(work.x, pageAddress, clusterInPage, bin);
+    if (OcclusionTested(inst) && IsOccluded(center, radius))
+    {
+        if (_OccConfig.x >= 2)
+        {
+            if (_OccConfig.x == 3)
+                InterlockedAdd(VG_Counters[Ctr(C_RECEIVER)], 1);
+            return;
+        }
+        uint slot;
+        if (DeferItem(P_DEFERRED_CLUSTERS, slot))
+        {
+            VG_OccludedClusters[_OccConfig.z + slot] = record;
+            return;
+        }
+    }
+
+    AppendVisible(record, binFlags, c.triangleCount, (mesh.meshFlags & VG_MESH_HW_RASTER) == 0 && UseSoftwareRaster(center, radius));
+}
+
+// Single thread: bins are few (unique materials); keeps allocation deterministic per view.
+[numthreads(1, 1, 1)]
+void AllocateBins(uint3 gid : SV_GroupID)
+{
+    g_Split = gid.x; // batched splits: one group per split
+    uint total = 0;
+    for (uint b = 0; b < _Counts.y; ++b)
+        total += VG_BinTriangles[BinSlot(b)] * 3;
+
+    uint base;
+    InterlockedAdd(VG_ArenaCounters[A_INDICES], total, base);
+    bool fits = base + total <= _Capacities.w;
+    if (!fits)
+        SetOverflow(16);
+
+    uint cursor = base;
+    for (uint bin = 0; bin < _Counts.y; ++bin)
+    {
+        uint count = fits ? VG_BinTriangles[BinSlot(bin)] * 3 : 0;
+        uint a = (DrawArgsBase() + bin) * 5;
+        VG_DrawArgs[a + 0] = count;             // indexCountPerInstance
+        VG_DrawArgs[a + 1] = count > 0 ? 1 : 0; // instanceCount
+        VG_DrawArgs[a + 2] = cursor;            // startIndex
+        VG_DrawArgs[a + 3] = 0;                 // baseVertex
+        VG_DrawArgs[a + 4] = 0;                 // startInstance
+        VG_BinCursor[BinSlot(bin)] = fits ? cursor : 0xFFFFFFFFu;
+        cursor += count;
+    }
+
+    uint slot = StatsSlot() * STATS_PER_VIEW;
+    VG_Stats[slot + 0] = VG_Counters[Ctr(C_INSTANCES)];
+    VG_Stats[slot + 1] = min(VG_Counters[C_GROUPS], _Capacities.x); // batched splits: the whole batch's
+    VG_Stats[slot + 2] = min(VG_Counters[Ctr(C_VISIBLE)], RecordCapacity());
+    VG_Stats[slot + 3] = VG_Counters[Ctr(C_TRIANGLES)];
+    VG_Stats[slot + 4] = VG_Counters[Ctr(C_OVERFLOW)] | (VG_Counters[C_OVERFLOW] & 3u); // + shared queue overflow
+    VG_Stats[slot + 5] = VG_Counters[Ctr(C_LIST1)];
+    VG_Stats[slot + 6] = _ViewConfig.y;
+    bool occlusion = _OccConfig.x == 1;
+    VG_Stats[slot + 7] = occlusion ? VG_PhaseState[_OccConfig.y + P_DEFERRED_INSTANCES] : 0;
+    VG_Stats[slot + 8] = occlusion ? VG_PhaseState[_OccConfig.y + P_DEFERRED_NODES] : 0;
+    VG_Stats[slot + 9] = occlusion ? VG_PhaseState[_OccConfig.y + P_DEFERRED_CLUSTERS] : 0;
+    VG_Stats[slot + 10] = 0; // phase 2 (FinishPhase2)
+    VG_Stats[slot + 11] = 0;
+    VG_Stats[slot + 12] = VG_Counters[Ctr(C_LIST2)];
+    VG_Stats[slot + 13] = 0;
+    VG_Stats[slot + 14] = VG_Counters[Ctr(C_RECEIVER)];
+    VG_Stats[slot + 15] = _OccConfig.x == 3 ? 1 : 0;
+}
+
+// records of the view's expanded bins (AppendVisible, list 3)
+uint ExpandListSize()
+{
+    return min(min(VG_Counters[Ctr(C_LIST3)], ListCapacity()), min(VG_Counters[Ctr(C_VISIBLE)], RecordCapacity()));
+}
+
+[numthreads(1, 1, 1)]
+void PrepareExpand(uint3 id : SV_DispatchThreadID)
+{
+    // batched splits: one dispatch, the split in the group z, as many groups as the largest split
+    uint splits = max(_Batch.x, 1u);
+    uint groups = 0;
+    for (uint s = 0; s < splits; ++s)
+    {
+        g_Split = s;
+        // views whose bins are all rasterised (visibility buffer, shadow raster) expand nothing:
+        // no groups instead of one idle group per visible cluster
+        groups = max(groups, ExpandListSize());
+    }
+    WriteDispatch(C_DISPATCH_EXPAND, groups, splits);
+}
+
+groupshared uint gs_VertexBase;
+groupshared uint gs_IndexBase;
+
+
+void StoreVertex(uint address, float3 position, float3 normal, float4 tangent, float2 uv0, float2 uv1, uint color)
+{
+    // layout (48 B, Unity attribute order): position f32x3 @0 | normal f32x3 @12 | tangent f16x4 @24 |
+    // color unorm8x4 @32 | uv0 f32x2 @36 | uv1 f16x2 @44
+    VG_ArenaVertices.Store3(address + 0, asuint(position));
+    VG_ArenaVertices.Store3(address + 12, asuint(normal));
+    uint2 t = uint2(f32tof16(tangent.x) | (f32tof16(tangent.y) << 16), f32tof16(tangent.z) | (f32tof16(tangent.w) << 16));
+    VG_ArenaVertices.Store2(address + 24, t);
+    VG_ArenaVertices.Store(address + 32, color);
+    VG_ArenaVertices.Store2(address + 36, asuint(uv0));
+    VG_ArenaVertices.Store(address + 44, f32tof16(uv1.x) | (f32tof16(uv1.y) << 16));
+}
+
+// one thread group per record of the view's expansion list
+[numthreads(128, 1, 1)]
+void Expand(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    // No early exit before the barrier: FXC requires the sync in uniform flow control and cannot
+    // prove that values read from a UAV are uniform across the group.
+    g_Split = gid.z;
+    uint item = LinearGroup(gid);
+    bool active = item < ExpandListSize();
+
+    uint recordIndex = active ? VG_RasterListsIn[ListIndex(3, item)] : 0;
+    uint4 vis = active ? VG_VisibleIn[recordIndex] : uint4(0, 0, 0, 0);
+    // resolve bins of visibility-buffer views / shadow bins of shadow-raster views are rasterised
+    uint binFlags = VG_BinFlags[vis.w];
+    bool programmable = ProgrammableInVisView(binFlags);
+    if ((binFlags & _ViewConfig.y) != 0 && !programmable)
+        active = false;
+    // `active` is uniform per group: idle groups (clusters rasterised elsewhere, the tail of a batch
+    // dispatch sized by its largest split) skip the instance / cluster loads
+    VgInstanceGpu inst = (VgInstanceGpu)0;
+    VgMeshGpu mesh = (VgMeshGpu)0;
+    VgCluster c = (VgCluster)0;
+    if (active)
+    {
+        inst = VG_Instances[vis.x];
+        mesh = VG_Meshes[inst.meshIndex];
+        c = VgLoadCluster(VG_PagePool, vis.y, vis.z);
+    }
+
+    // M10: bins with a generated VG variant of their material pull their vertices in the material's
+    // own passes (VgPulled.hlsl): the indices are (frame record << 7 | vertex), no arena vertices
+    bool pulled = (binFlags & VG_BIN_PULLED) != 0 && _Iteration.z == DEBUG_NONE && !programmable; // debug views colour the expansion
+    if (gi == 0)
+    {
+        uint vb = 0xFFFFFFFFu, ib = 0xFFFFFFFFu;
+        if (active && VG_BinCursor[BinSlot(vis.w)] != 0xFFFFFFFFu)
+        {
+            if (programmable)
+                vb = 0; // no vertices, no frame record: the indices name the view's own VG_Visible record
+            else if (pulled)
+            {
+                InterlockedAdd(VG_ArenaCounters[A_SHADOW_RECORDS], 1, vb);
+                if (vb >= _ViewConfig.w)
+                {
+                    SetOverflow(32);
+                    vb = 0xFFFFFFFFu;
+                }
+                else
+                    VG_ShadowRecords[vb] = vis;
+            }
+            else
+                InterlockedAdd(VG_ArenaCounters[A_VERTICES], c.vertexCount, vb);
+            if (!pulled && !programmable && vb + c.vertexCount > _Capacities.z)
+            {
+                SetOverflow(8);
+                vb = 0xFFFFFFFFu;
+            }
+            // the index range is always consumed so the bin's draw stays consistent
+            InterlockedAdd(VG_BinCursor[BinSlot(vis.w)], c.triangleCount * 3, ib);
+        }
+        gs_VertexBase = vb;
+        gs_IndexBase = ib;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint vb = gs_VertexBase;
+    uint ib = gs_IndexBase;
+    if (ib == 0xFFFFFFFFu)
+        return;
+    bool haveVertices = vb != 0xFFFFFFFFu;
+
+    if (gi < c.triangleCount)
+    {
+        uint3 t = VgDecodeTriangle(VG_PagePool, c, gi);
+        // mirrored instance: vertices are baked in world space, so restore front-facing winding
+        if (inst.flags & VG_INSTANCE_MIRRORED)
+            t = t.xzy;
+        // arena full: emit degenerate triangles so the draw's index range stays valid
+        uint3 index = pulled ? (vb << 7) + t : t + vb;
+        if (programmable)
+        {
+            // (VG_Visible record << 7 | vertex): shared vertices hit the post-transform cache; the
+            // triangle's visibility ID is looked up by arena triangle (SV_PrimitiveID, VgVisRaster.hlsl)
+            index = (recordIndex << 7) + t;
+            VG_TriangleIds[(ib / 3) + gi] = VgPackVisibility(recordIndex, gi);
+        }
+        VG_ArenaIndices.Store3((ib + gi * 3) * 4, haveVertices ? index : uint3(0, 0, 0));
+    }
+
+    if (haveVertices && !pulled && !programmable && gi < c.vertexCount)
+    {
+        VgVertex v = VgDecodeVertex(VG_PagePool, c, gi, mesh);
+        float3 p = VgTransformPoint(inst, v.position);
+        float3 n = VgTransformNormal(inst, v.normal);
+        float4 t = float4(normalize(VgTransformDirection(inst, v.tangent.xyz)), v.tangent.w * ((inst.flags & VG_INSTANCE_MIRRORED) ? -1.0 : 1.0));
+        uint color = _Iteration.z != DEBUG_NONE ? DebugId(_Iteration.z, vis, c, mesh) : v.color;
+        StoreVertex((vb + gi) * 48, p, n, t, v.uv0, v.uv1, color);
+    }
+}
+
+// Raster args per view slot (32 uints at _ViewConfig.z):
+//   0 / 4    phase 1 hardware single / double-sided   IndirectDrawArgs (384, clusters, 0, 0)
+//   8 / 12   phase 2 hardware single / double-sided
+//   16 / 20  phase 1 / phase 2 software               dispatch args (x, y, 1), one group per cluster
+void WriteDrawArgs(uint a, uint instances)
+{
+    // one instance per visible cluster, 128 triangles x 3 corners (unused triangles are culled in the VS)
+    VG_RasterArgs[a + 0] = 384;
+    VG_RasterArgs[a + 1] = instances;
+    VG_RasterArgs[a + 2] = 0;
+    VG_RasterArgs[a + 3] = 0;
+}
+
+void WriteSwDispatch(uint a, uint groups)
+{
+    VG_RasterArgs[a + 0] = min(groups, 65535u);
+    VG_RasterArgs[a + 1] = groups == 0 ? 0 : (groups + 65534u) / 65535u;
+    VG_RasterArgs[a + 2] = 1;
+}
+
+uint ListSize(uint list)
+{
+    return min(VG_Counters[Ctr(C_LIST0 + list)], ListCapacity());
+}
+
+[numthreads(1, 1, 1)]
+void PrepareRaster(uint3 id : SV_DispatchThreadID)
+{
+    WriteDrawArgs(_ViewConfig.z + 0, ListSize(0));
+    WriteDrawArgs(_ViewConfig.z + 4, ListSize(1));
+    WriteDrawArgs(_ViewConfig.z + 8, 0);
+    WriteDrawArgs(_ViewConfig.z + 12, 0);
+    WriteSwDispatch(_ViewConfig.z + 16, ListSize(2));
+    WriteSwDispatch(_ViewConfig.z + 20, 0);
+    // list sizes after phase 1: phase-2 draws start there (also read without occlusion)
+    VG_PhaseState[_OccConfig.y + P_PHASE1_VISIBLE] = min(VG_Counters[C_VISIBLE], _Capacities.y);
+    for (uint l = 0; l < 3; ++l)
+    {
+        VG_PhaseState[_OccConfig.y + P_PHASE1_LIST + l] = ListSize(l);
+        VG_PhaseState[_OccConfig.y + P_PHASE2_LIST + l] = 0;
+    }
+}
+
+// ---- phase 2 (custom pass) ------------------------------------------------------------------
+
+[numthreads(1, 1, 1)]
+void BeginPhase2(uint3 id : SV_DispatchThreadID)
+{
+    for (uint i = 0; i < C_COUNT; ++i)
+        VG_Counters[i] = 0;
+    VG_Counters[C_VISIBLE] = VG_PhaseState[_OccConfig.y + P_PHASE1_VISIBLE];
+    for (uint l = 0; l < 3; ++l)
+        VG_Counters[C_LIST0 + l] = VG_PhaseState[_OccConfig.y + P_PHASE1_LIST + l];
+    uint nodes = min(VG_PhaseState[_OccConfig.y + P_DEFERRED_NODES], _OccConfig.w);
+    uint clusters = min(VG_PhaseState[_OccConfig.y + P_DEFERRED_CLUSTERS], _OccConfig.w);
+    WriteDispatch(C_DISPATCH_DEFERRED_NODES, (nodes + 63) / 64);
+    WriteDispatch(C_DISPATCH_DEFERRED_CLUSTERS, (clusters + 63) / 64);
+}
+
+[numthreads(64, 1, 1)]
+void CullDeferredInstances(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < min(VG_PhaseState[_OccConfig.y + P_DEFERRED_INSTANCES], _OccConfig.w))
+        ProcessInstance(VG_OccludedInstances[_OccConfig.z + id.x]);
+}
+
+[numthreads(64, 1, 1)]
+void SeedDeferredNodes(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint item = LinearGroup(gid) * 64 + gi;
+    if (item >= min(VG_PhaseState[_OccConfig.y + P_DEFERRED_NODES], _OccConfig.w))
+        return;
+    // re-tested (frustum, LOD, occlusion vs the current HZB) by the first traversal iteration
+    uint at;
+    InterlockedAdd(VG_Counters[C_QUEUE0], 1, at);
+    if (at >= _Counts.w)
+    {
+        SetOverflow(1);
+        return;
+    }
+    VG_NodeQueue0[at] = VG_OccludedNodes[_OccConfig.z + item];
+}
+
+[numthreads(64, 1, 1)]
+void CullDeferredClusters(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint item = LinearGroup(gid) * 64 + gi;
+    if (item >= min(VG_PhaseState[_OccConfig.y + P_DEFERRED_CLUSTERS], _OccConfig.w))
+        return;
+    // LOD, frustum and cone already passed in phase 1; only occlusion changes
+    uint4 record = VG_OccludedClusters[_OccConfig.z + item];
+    VgInstanceGpu inst = VG_Instances[record.x];
+    VgCluster c = VgLoadCluster(VG_PagePool, record.y, record.z);
+    float3 center = VgTransformPoint(inst, c.cullCenter);
+    float radius = c.cullRadius * InstanceScale(inst);
+    if (IsOccluded(center, radius))
+        return;
+    bool software = (VG_Meshes[inst.meshIndex].meshFlags & VG_MESH_HW_RASTER) == 0 && UseSoftwareRaster(center, radius);
+    AppendVisible(record, VG_BinFlags[record.w], c.triangleCount, software);
+}
+
+[numthreads(1, 1, 1)]
+void FinishPhase2(uint3 id : SV_DispatchThreadID)
+{
+    uint added[3];
+    for (uint l = 0; l < 3; ++l)
+    {
+        uint before = VG_PhaseState[_OccConfig.y + P_PHASE1_LIST + l];
+        uint after = ListSize(l);
+        added[l] = after > before ? after - before : 0;
+        VG_PhaseState[_OccConfig.y + P_PHASE2_LIST + l] = added[l];
+    }
+    WriteDrawArgs(_ViewConfig.z + 8, added[0]);
+    WriteDrawArgs(_ViewConfig.z + 12, added[1]);
+    WriteSwDispatch(_ViewConfig.z + 20, added[2]);
+
+    uint slot = _Iteration.y * STATS_PER_VIEW;
+    VG_Stats[slot + 10] = added[0] + added[1] + added[2];
+    VG_Stats[slot + 11] = VG_Counters[C_TRIANGLES];
+    VG_Stats[slot + 13] = added[2];
+    VG_Stats[slot + 4] |= VG_Counters[C_OVERFLOW];
+}
+
+// ---- M6 shadow raster ------------------------------------------------------------------------
+// A shadow-raster view keeps its shadow-bin records in raster lists 0 / 1 of region 0 (single /
+// double-sided). PrepareShadowRaster reserves a range of the frame-wide VG_ShadowRecords plus one
+// index range per list in the arena index buffer; CompactShadow (one group per record) copies the
+// record and writes its triangles as indices (global record << 7 | vertex in cluster). HDRP then
+// draws them with two BRG indexed indirect draws of the arena mesh and VgShadowRaster.shader,
+// whose vertex shader decodes only the position of SV_VertexID: no vertex expansion, and indexed
+// vertices are shared through the post-transform cache.
+// Raster args of the view (at _ViewConfig.z): 0 / 8 IndirectDrawIndexedArgs (single / double-sided),
+// 16 compaction dispatch (one group per record).
+
+void WriteShadowArgs(uint a, uint records)
+{
+    VG_RasterArgs[a + 0] = records * 384; // vertexCountPerInstance
+    VG_RasterArgs[a + 1] = records > 0 ? 1 : 0;
+    VG_RasterArgs[a + 2] = 0;
+    VG_RasterArgs[a + 3] = 0;
+}
+
+[numthreads(1, 1, 1)]
+void PrepareShadowRaster(uint3 gid : SV_GroupID)
+{
+    g_Split = gid.x; // batched splits: one group per split
+    uint n0 = ListSize(0), n1 = ListSize(1);
+    uint base;
+    InterlockedAdd(VG_ArenaCounters[A_SHADOW_RECORDS], n0 + n1, base);
+    if (base + n0 + n1 > _ViewConfig.w)
+    {
+        SetOverflow(32); // this split misses its VG shadows (raise shadowRecordCapacity)
+        n0 = n1 = base = 0;
+    }
+    VG_ShadowViews[StatsSlot()] = uint4(base, n0, n1, 0);
+    // procedural draws: 128 triangles x 3 corners per record (VgShadowRaster.shader culls the unused)
+    WriteShadowArgs(RasterArgsBase() + 0, n0);
+    WriteShadowArgs(RasterArgsBase() + 8, n1);
+    WriteSwDispatch(RasterArgsBase() + 16, (n0 + n1 + 63) / 64); // CompactShadow groups
+    VG_Stats[StatsSlot() * STATS_PER_VIEW + 4] = VG_Counters[Ctr(C_OVERFLOW)] | (VG_Counters[C_OVERFLOW] & 3u);
+}
+
+// Batched splits: one CompactShadow dispatch for all splits (split in the group z).
+[numthreads(1, 1, 1)]
+void PrepareBatchCompact(uint3 id : SV_DispatchThreadID)
+{
+    uint groups = 0;
+    for (uint s = 0; s < _Batch.x; ++s)
+    {
+        uint4 view = VG_ShadowViews[VG_SplitViews[s].config.y];
+        groups = max(groups, (view.y + view.z + 63) / 64);
+    }
+    WriteDispatch(C_DISPATCH_BATCH, groups, max(_Batch.x, 1u));
+}
+
+// 64 records per group: copies the view's shadow list records into its range of VG_ShadowRecords,
+// which VgShadowRaster.shader draws procedurally (no index writes)
+[numthreads(64, 1, 1)]
+void CompactShadow(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    g_Split = gid.z;
+    uint i = LinearGroup(gid) * 64 + gi;
+    uint4 view = VG_ShadowViews[StatsSlot()];
+    if (i >= view.y + view.z)
+        return;
+    uint list = i < view.y ? 0 : 1;
+    uint j = i < view.y ? i : i - view.y;
+    VG_ShadowRecords[view.x + i] = VG_Visible[VG_RasterLists[ListIndex(list, j)]];
+}
+
+// Culling-time placeholder of a shadow view culled later (receiver culling in the custom pass):
+// its draws must be empty if that pass never runs.
+[numthreads(64, 1, 1)]
+void ClearShadowView(uint3 id : SV_DispatchThreadID)
+{
+    for (uint b = id.x; b < _Counts.y; b += 64)
+    {
+        uint a = (_Counts.z + b) * 5;
+        VG_DrawArgs[a + 0] = 0;
+        VG_DrawArgs[a + 1] = 0;
+        VG_DrawArgs[a + 2] = 0;
+        VG_DrawArgs[a + 3] = 0;
+        VG_DrawArgs[a + 4] = 0;
+    }
+    if (id.x < 24)
+        VG_RasterArgs[_ViewConfig.z + id.x] = 0;
+    if (id.x == 0)
+        VG_ShadowViews[_Iteration.y] = uint4(0, 0, 0, 0);
+    if (id.x < STATS_PER_VIEW)
+        VG_Stats[_Iteration.y * STATS_PER_VIEW + id.x] = 0;
+}
+
+// ---- M7 streaming feedback -------------------------------------------------------------------
+
+// After every view of the frame: (page, priority) pairs for the CPU readback; clears the per-page
+// feedback words that were set.
+[numthreads(64, 1, 1)]
+void GatherFeedback(uint3 id : SV_DispatchThreadID)
+{
+    uint total = VG_Feedback[0];
+    uint count = min(total, _StreamingConfig.y);
+    if (id.x == 0)
+        VG_FeedbackOut[0] = count | (total > _StreamingConfig.y ? 0x80000000u : 0u);
+    if (id.x >= count)
+        return;
+    uint page = VG_Feedback[1 + id.x];
+    uint word = 1 + _StreamingConfig.y + page;
+    VG_FeedbackOut[1 + 2 * id.x] = page;
+    VG_FeedbackOut[2 + 2 * id.x] = VG_Feedback[word];
+    VG_Feedback[word] = 0;
+}
+
+[numthreads(1, 1, 1)]
+void ResetFeedback(uint3 id : SV_DispatchThreadID)
+{
+    VG_Feedback[0] = 0;
+}
+
+// ---- M10 per-instance BRG batch ----------------------------------------------------------------
+
+// DOTS instance data of the pulled / resolve batch (VgWorld.PulledBatch): four arrays of packed
+// float3x4 (columns) after 64 zero bytes: unity_ObjectToWorld, unity_WorldToObject,
+// unity_MatrixPreviousM, unity_MatrixPreviousMI, _Counts.x instances each (capacity), instances
+// [_Counts.z, _Counts.z + _Counts.w) rewritten.
+RWByteAddressBuffer VG_InstanceMatrices;
+
+void StorePacked(uint array, uint i, float4 r0, float4 r1, float4 r2)
+{
+    uint a = 64 + (array * _Counts.x + i) * 48;
+    VG_InstanceMatrices.Store4(a + 0, asuint(float4(r0.x, r1.x, r2.x, r0.y)));
+    VG_InstanceMatrices.Store4(a + 16, asuint(float4(r1.y, r2.y, r0.z, r1.z)));
+    VG_InstanceMatrices.Store4(a + 32, asuint(float4(r2.z, r0.w, r1.w, r2.w)));
+}
+
+// inverse of the affine transform given by rows r0..r2 (rows of the inverse)
+void InverseAffine(float4 r0, float4 r1, float4 r2, out float4 i0, out float4 i1, out float4 i2)
+{
+    float3x3 m = float3x3(r0.xyz, r1.xyz, r2.xyz);
+    float3 c0 = cross(m[1], m[2]), c1 = cross(m[2], m[0]), c2 = cross(m[0], m[1]);
+    float det = dot(m[0], c0);
+    float3x3 inv = transpose(float3x3(c0, c1, c2)) / (abs(det) > 1e-30 ? det : 1e-30);
+    float3 t = -mul(inv, float3(r0.w, r1.w, r2.w));
+    i0 = float4(inv[0], t.x);
+    i1 = float4(inv[1], t.y);
+    i2 = float4(inv[2], t.z);
+}
+
+[numthreads(64, 1, 1)]
+void WriteInstanceMatrices(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Counts.w)
+        return;
+    uint i = _Counts.z + id.x;
+    VgInstanceGpu inst = VG_Instances[i];
+    StorePacked(0, i, inst.localToWorld0, inst.localToWorld1, inst.localToWorld2);
+    StorePacked(1, i, inst.worldToLocal0, inst.worldToLocal1, inst.worldToLocal2);
+    StorePacked(2, i, inst.prevLocalToWorld0, inst.prevLocalToWorld1, inst.prevLocalToWorld2);
+    float4 p0, p1, p2;
+    InverseAffine(inst.prevLocalToWorld0, inst.prevLocalToWorld1, inst.prevLocalToWorld2, p0, p1, p2);
+    StorePacked(3, i, p0, p1, p2);
+}

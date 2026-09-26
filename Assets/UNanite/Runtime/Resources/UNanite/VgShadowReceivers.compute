@@ -1,0 +1,355 @@
+// M6 shadow receiver pyramid ("VG.ShadowReceivers"): for one shadow split, the farthest light-space
+// depth of anything the camera can see, per light-space texel, as a max pyramid in the M4 HZB layout
+// (VgHzb.compute). VgCull.compute (_OccConfig.x = 3) rejects casters whose nearest light depth is
+// behind every receiver in their footprint: such casters cannot darken anything visible.
+// Up to 16 splits are built together (one dispatch per step, split = dispatch z or y); split s uses
+// texels [s * T, (s + 1) * T) of the splat and pyramid buffers (T = _RcvMask.w).
+//
+//   TileDepth   once per camera: per 16x16 pixel tile min / max linear depth (sky = far plane) and
+//               min / max of opaque pixels only (camera depth of the current frame, after HDRP's prepass)
+//   TileUp      once per camera: min depth of 64x64 and 256x256 pixel nodes
+//   ClearSplat  receiver splat pyramid = 0 (empty)
+//   Splat       per (node, depth chunk): a view-ray slab between two chunk depths is projected into
+//               the split, dilated by the filter / bias margins and InterlockedMax'ed into the pyramid
+//               level where it covers <= 2x2 texels (hierarchical splat, bounded cost per slab).
+//               "Visible volume": every pixel's ray from the near plane to its depth, split
+//               telescopically - 256 px nodes cover near .. their min depth, 64 px nodes their parent's
+//               min .. their own min, 16 px tiles their parent's min .. their max - so the long common
+//               part in front of the nearest surface is splatted by few large nodes.
+//               "Visible surfaces": 16 px tiles, opaque min .. max depth.
+//   Finalize    level-0 texel = max of its splat and every ancestor's splat -> float (VG_HzbOut)
+//   Pyramid     max pyramid, 4 levels per dispatch in group-shared memory (levels 1-4, then 5-8)
+//
+// Chunks follow a geometric depth grid (near * (far / near)^(k / K)) so long view rays do not turn
+// into one huge light-space rectangle. Light depth = split clip z / w (Unity culling matrix, larger
+// = farther from the light); pyramid values are ordered-uint encoded floats, 0 = no receiver.
+
+#pragma kernel TileDepth
+#pragma kernel TileUp
+#pragma kernel ClearSplat
+#pragma kernel Splat
+#pragma kernel Finalize
+#pragma kernel Pyramid
+
+Texture2DArray<float> _VgDepth;
+RWStructuredBuffer<float4> VG_TileDepth;   // 16 px tiles: (min, max, opaque min, opaque max) linear depth, sky = far;
+                                           // then 64 px and 256 px nodes: (min, 0, 0, 0)
+RWStructuredBuffer<uint> VG_RcvSplat;      // encoded farthest receiver depth, all pyramid levels
+RWStructuredBuffer<float> VG_HzbOut;       // receiver pyramid (float, M4 HZB layout)
+
+float4x4 _RcvCamInvViewProj; // (ndc.xy, device depth) -> world, camera of the current frame (unjittered)
+float4x4 _RcvLightViewProj[16]; // world -> split clip (BatchCullingSplit.cullingMatrix), per split of the batch
+float4 _RcvProj;             // camera GPU projection M22, M23, M32, M33 (linear depth <-> device depth)
+float4 _RcvRange;            // x: near, y: far, z: chunk count, w: mode (1 visible volume, 2 visible surfaces)
+float4 _RcvSphere[16];       // split culling sphere (world xyz, radius; radius <= 0: none)
+float4 _RcvMargin;           // x: margin in shadow texels, y: margin in world units, z: shadow texel size in NDC (2 / resolution)
+float _RcvSkyDepth;          // device depth of cleared (sky) pixels
+uint4 _RcvScreen;            // camera width, height, tiles x, tiles y
+uint4 _RcvMask;              // x: level-0 size (texels), y: level count, z: screen size (pixels = 2 x level 0), w: texels per split (all levels)
+uint _RcvSplits;             // splits in this batch
+uint4 _RcvLevel;             // Pyramid: x source level; TileUp: x node level (1: 64 px, 2: 256 px)
+
+#define TILE 16
+
+uint EncodeDepth(float f)
+{
+    uint u = asuint(f);
+    return (u >> 31) ? ~u : (u | 0x80000000u);
+}
+
+float DecodeDepth(uint e)
+{
+    if (e == 0)
+        return -3e38; // no receiver
+    return asfloat((e >> 31) ? (e & 0x7FFFFFFFu) : ~e);
+}
+
+float LinearDepth(float device)
+{
+    return (_RcvProj.y - device * _RcvProj.w) / (_RcvProj.x - device * _RcvProj.z);
+}
+
+float DeviceDepth(float viewDepth)
+{
+    return (-_RcvProj.x * viewDepth + _RcvProj.y) / (-_RcvProj.z * viewDepth + _RcvProj.w);
+}
+
+groupshared uint gs_Min;
+groupshared uint gs_Max;
+groupshared uint gs_MinSurf;
+groupshared uint gs_MaxSurf;
+
+// 8x8 threads per 16x16 tile, 2x2 pixels per thread (fewer group-shared atomics)
+[numthreads(TILE / 2, TILE / 2, 1)]
+void TileDepth(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    if (gi == 0)
+    {
+        gs_Min = gs_MinSurf = 0x7F7FFFFFu;
+        gs_Max = gs_MaxSurf = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float mn = 3e38, mx = 0, mnSurf = 3e38, mxSurf = 0;
+    [unroll]
+    for (uint k = 0; k < 4; ++k)
+    {
+        uint2 p = gid.xy * TILE + gtid.xy * 2 + uint2(k & 1, k >> 1);
+        if (p.x < _RcvScreen.x && p.y < _RcvScreen.y)
+        {
+            float device = _VgDepth.Load(int4(p, 0, 0));
+            bool sky = device == _RcvSkyDepth;
+            float d = sky ? _RcvRange.y : clamp(LinearDepth(device), _RcvRange.x, _RcvRange.y);
+            mn = min(mn, d);
+            mx = max(mx, d);
+            if (!sky)
+            {
+                mnSurf = min(mnSurf, d);
+                mxSurf = max(mxSurf, d);
+            }
+        }
+    }
+    // positive floats order like their bits
+    InterlockedMin(gs_Min, asuint(mn));
+    InterlockedMax(gs_Max, asuint(mx));
+    InterlockedMin(gs_MinSurf, asuint(mnSurf));
+    InterlockedMax(gs_MaxSurf, asuint(mxSurf));
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gi == 0)
+        VG_TileDepth[gid.y * _RcvScreen.z + gid.x] = float4(asfloat(gs_Min), asfloat(gs_Max), asfloat(gs_MinSurf), asfloat(gs_MaxSurf));
+}
+
+// node grids: level 0 = 16 px tiles, level 1 = 4x4 tiles, level 2 = 16x16 tiles
+uint2 NodeGrid(uint level)
+{
+    uint span = 1u << (2 * level);
+    return (_RcvScreen.zw + span - 1) / span;
+}
+
+uint NodeBase(uint level)
+{
+    uint2 g0 = NodeGrid(0), g1 = NodeGrid(1), g2 = NodeGrid(2);
+    return (level > 0 ? g0.x * g0.y : 0) + (level > 1 ? g1.x * g1.y : 0) + (level > 2 ? g2.x * g2.y : 0);
+}
+
+[numthreads(64, 1, 1)]
+void TileUp(uint3 id : SV_DispatchThreadID)
+{
+    uint level = _RcvLevel.x;
+    uint2 grid = NodeGrid(level);
+    if (id.x >= grid.x * grid.y)
+        return;
+    uint2 node = uint2(id.x % grid.x, id.x / grid.x);
+    uint span = 1u << (2 * level);
+    uint2 lo = node * span;
+    uint2 hi = min(lo + span, _RcvScreen.zw);
+    float m = 3e38;
+    for (uint y = lo.y; y < hi.y; ++y)
+        for (uint x = lo.x; x < hi.x; ++x)
+            m = min(m, VG_TileDepth[y * _RcvScreen.z + x].x);
+    VG_TileDepth[NodeBase(level) + id.x] = float4(m, 0, 0, 0);
+}
+
+[numthreads(64, 1, 1)]
+void ClearSplat(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _RcvMask.w * _RcvSplits)
+        VG_RcvSplat[id.x] = 0;
+}
+
+uint LevelOffset(uint level)
+{
+    uint offset = 0;
+    for (uint l = 0; l < level; ++l)
+    {
+        uint s = max(_RcvMask.x >> l, 1u);
+        offset += s * s;
+    }
+    return offset;
+}
+
+float3 WorldAt(float2 ndc, float viewDepth)
+{
+    float4 p = mul(_RcvCamInvViewProj, float4(ndc, DeviceDepth(viewDepth), 1.0));
+    return p.xyz / p.w;
+}
+
+// thread = (node, depth chunk)
+[numthreads(64, 1, 1)]
+void Splat(uint3 id : SV_DispatchThreadID)
+{
+    uint base1 = NodeBase(1), base2 = NodeBase(2), total = NodeBase(3);
+    uint split = id.z;
+    if (id.x >= total || split >= _RcvSplits)
+        return;
+    float4x4 lightViewProj = _RcvLightViewProj[split];
+    float4 sphere = _RcvSphere[split];
+    uint level = id.x >= base2 ? 2 : (id.x >= base1 ? 1 : 0);
+    uint index = id.x - (level == 2 ? base2 : (level == 1 ? base1 : 0));
+    uint2 grid = NodeGrid(level);
+    uint2 node = uint2(index % grid.x, index / grid.x);
+    float4 td = VG_TileDepth[id.x];
+
+    float nearZ = _RcvRange.x, farZ = _RcvRange.y;
+    float start, end;
+    if (_RcvRange.w == 1)
+    {
+        // visible volume, telescoped: [parent min, own min] (level 0: [parent min, own max])
+        uint2 parent = node >> 2;
+        start = level == 2 ? nearZ : VG_TileDepth[NodeBase(level + 1) + parent.y * NodeGrid(level + 1).x + parent.x].x;
+        end = level == 0 ? td.y : td.x;
+    }
+    else
+    {
+        if (level != 0)
+            return;
+        start = td.z; // opaque surfaces only
+        end = td.w;
+    }
+    float ratio = farZ / nearZ;
+    float k0 = nearZ * exp2(log2(ratio) * (id.y / _RcvRange.z));
+    float k1 = nearZ * exp2(log2(ratio) * ((id.y + 1) / _RcvRange.z));
+    float d0 = max(k0, start);
+    float d1 = min(k1, end);
+    if (d0 > d1)
+        return;
+
+    // node rectangle (+1 pixel: TAA jitter of the depth buffer vs the unjittered matrix)
+    float2 screen = float2(_RcvScreen.xy);
+    float span = (float)(TILE << (2 * level));
+    float2 pMin = float2(node) * span - 1.0;
+    float2 pMax = min(float2(node + 1) * span, screen) + 1.0;
+    // D3D-style pixels (y down) -> NDC, as in IsOccluded (VgCull.compute)
+    float2 nMin = float2(pMin.x / screen.x * 2.0 - 1.0, 1.0 - pMax.y / screen.y * 2.0);
+    float2 nMax = float2(pMax.x / screen.x * 2.0 - 1.0, 1.0 - pMin.y / screen.y * 2.0);
+
+    float3 corners[8];
+    [unroll]
+    for (uint i = 0; i < 8; ++i)
+        corners[i] = WorldAt(float2((i & 1) ? nMax.x : nMin.x, (i & 2) ? nMax.y : nMin.y), (i & 4) ? d1 : d0);
+
+    // split culling sphere (directional cascades): receivers outside never sample this split
+    if (sphere.w > 0)
+    {
+        float3 lo = corners[0], hi = corners[0];
+        [unroll]
+        for (uint j = 1; j < 8; ++j)
+        {
+            lo = min(lo, corners[j]);
+            hi = max(hi, corners[j]);
+        }
+        float3 q = clamp(sphere.xyz, lo, hi);
+        float r = sphere.w * 1.05 + _RcvMargin.y;
+        if (dot(q - sphere.xyz, q - sphere.xyz) > r * r)
+            return;
+    }
+
+    float row0 = length(lightViewProj[0].xyz);
+    float row1 = length(lightViewProj[1].xyz);
+    float row2 = length(lightViewProj[2].xyz);
+    float row3 = length(lightViewProj[3].xyz);
+    float2 lMin = 1e30;
+    float2 lMax = -1e30;
+    float zMax = -1e30;
+    bool full = false;
+    [unroll]
+    for (uint c = 0; c < 8; ++c)
+    {
+        float4 clip = mul(lightViewProj, float4(corners[c], 1.0));
+        if (clip.w <= 1e-4)
+        {
+            full = true; // the slab reaches behind the light's projection plane
+            continue;
+        }
+        float3 ndc = clip.xyz / clip.w;
+        // margins: shadow texels (uniform in NDC) + world units (NDC per world unit at this point)
+        float texelWorld = _RcvMargin.z * clip.w / max(row0, 1e-9);
+        float2 m = _RcvMargin.x * _RcvMargin.z + _RcvMargin.y * float2(row0 + abs(ndc.x) * row3, row1 + abs(ndc.y) * row3) / clip.w;
+        float mz = (_RcvMargin.y + _RcvMargin.x * texelWorld) * (row2 + abs(ndc.z) * row3) / clip.w;
+        lMin = min(lMin, ndc.xy - m);
+        lMax = max(lMax, ndc.xy + m);
+        zMax = max(zMax, ndc.z + mz);
+    }
+    if (full)
+    {
+        lMin = -1.0;
+        lMax = 1.0;
+        zMax = 3e38;
+    }
+    if (lMax.x < -1.0 || lMax.y < -1.0 || lMin.x > 1.0 || lMin.y > 1.0)
+        return; // outside the split
+
+    float size = (float)_RcvMask.z;
+    float2 sMin = clamp(float2(lMin.x * 0.5 + 0.5, 0.5 - lMax.y * 0.5) * size, 0.0, size - 1.0);
+    float2 sMax = clamp(float2(lMax.x * 0.5 + 0.5, 0.5 - lMin.y * 0.5) * size, 0.0, size - 1.0);
+    uint2 a = (uint2)sMin;
+    uint2 b = (uint2)sMax;
+
+    // level L texels cover 2^(L+1) pixels: the level where the rectangle spans <= 2x2 texels
+    uint mip = 0;
+    while (mip + 1 < _RcvMask.y && (((b.x >> (mip + 1)) - (a.x >> (mip + 1))) > 1 || ((b.y >> (mip + 1)) - (a.y >> (mip + 1))) > 1))
+        ++mip;
+    uint width = max(_RcvMask.x >> mip, 1u);
+    uint offset = split * _RcvMask.w + LevelOffset(mip);
+    uint2 ta = min(a >> (mip + 1), width - 1);
+    uint2 tb = min(b >> (mip + 1), width - 1);
+    uint value = EncodeDepth(zMax);
+    for (uint y = ta.y; y <= tb.y; ++y)
+        for (uint x = ta.x; x <= tb.x; ++x)
+            InterlockedMax(VG_RcvSplat[offset + y * width + x], value);
+}
+
+// level-0 texel: its own splat and every coarser splat covering it (hierarchical splat resolve)
+[numthreads(64, 1, 1)]
+void Finalize(uint3 id : SV_DispatchThreadID)
+{
+    uint size0 = _RcvMask.x;
+    if (id.x >= size0 * size0 || id.y >= _RcvSplits)
+        return;
+    uint2 t = uint2(id.x % size0, id.x / size0);
+    uint value = 0;
+    uint splitBase = id.y * _RcvMask.w;
+    uint offset = splitBase;
+    for (uint l = 0; l < _RcvMask.y; ++l)
+    {
+        uint size = max(size0 >> l, 1u);
+        uint2 tl = t >> l;
+        value = max(value, VG_RcvSplat[offset + tl.y * size + tl.x]);
+        offset += size * size;
+    }
+    VG_HzbOut[splitBase + id.x] = DecodeDepth(value);
+}
+
+groupshared float gs_Pyr[TILE * TILE];
+
+// 16x16 source texels per group -> the next 4 levels (max), in place in group-shared memory
+[numthreads(TILE, TILE, 1)]
+void Pyramid(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint srcLevel = _RcvLevel.x;
+    uint srcSize = max(_RcvMask.x >> srcLevel, 1u);
+    uint splitBase = gid.z * _RcvMask.w; // dispatch z = split (never beyond the batch)
+    uint2 p = gid.xy * TILE + gtid.xy;
+    gs_Pyr[gtid.y * TILE + gtid.x] = (p.x < srcSize && p.y < srcSize) ? VG_HzbOut[splitBase + LevelOffset(srcLevel) + p.y * srcSize + p.x] : -3e38;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint k = 1; k <= 4; ++k)
+    {
+        uint step = 1u << k;
+        uint mip = srcLevel + k;
+        if (mip < _RcvMask.y && (gtid.x & (step - 1)) == 0 && (gtid.y & (step - 1)) == 0)
+        {
+            uint h = step >> 1;
+            uint i = gtid.y * TILE + gtid.x;
+            float m = max(max(gs_Pyr[i], gs_Pyr[i + h]), max(gs_Pyr[i + h * TILE], gs_Pyr[i + h * TILE + h]));
+            gs_Pyr[i] = m;
+            uint size = max(_RcvMask.x >> mip, 1u);
+            uint2 o = p >> k;
+            if (o.x < size && o.y < size)
+                VG_HzbOut[splitBase + LevelOffset(mip) + o.y * size + o.x] = m;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}

@@ -1,0 +1,25 @@
+{
+    "sourceGuid": "9ef6089f32dde634788c6de453630fa1",
+    "procedural": {
+        "kind": "",
+        "subdivisions": 7,
+        "seed": 0
+    },
+    "settings": {
+        "maxTriangles": 128,
+        "groupSize": 16,
+        "autoPositionPrecision": true,
+        "positionPrecision": 12,
+        "normalBits": 10,
+        "uvPrecision": 13,
+        "normalWeight": 0.5,
+        "uvWeight": 0.25,
+        "colorWeight": 0.25,
+        "keepTangents": true,
+        "keepLightmapUVs": true,
+        "keepVertexColors": true,
+        "regularize": false,
+        "threadCount": 0,
+        "pageFile": true
+    }
+}

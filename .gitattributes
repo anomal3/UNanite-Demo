@@ -1,0 +1,11 @@
+# Files are stored byte for byte: no line-ending conversion and no Git LFS.
+# (Unity serializes some .asset files as binary, a text conversion would corrupt them.)
+* -text
+
+*.cs      diff=csharp
+*.unity   merge=unityyamlmerge linguist-language=yaml
+*.prefab  merge=unityyamlmerge linguist-language=yaml
+*.asset   merge=unityyamlmerge
+*.hlsl    linguist-language=hlsl
+*.compute linguist-language=hlsl
+*.shader  linguist-language=ShaderLab

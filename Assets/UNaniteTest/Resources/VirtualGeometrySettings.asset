@@ -1,0 +1,63 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 0c15bd04981583849abdfd23e5ab829d, type: 3}
+  m_Name: VirtualGeometrySettings
+  m_EditorClassIdentifier: UNanite.Runtime::UNanite.VirtualGeometrySettings
+  pixelError: 1
+  shadowTexelError: 2
+  shadowCameraLod: 1
+  shadowCasterFrustum: 1
+  batchShadowCulling: 1
+  shadowRasterShaders:
+  - Shader Graphs/Rock
+  pulledMaterials: 1
+  maxSortedTransparentInstances: 256
+  programmableRaster: 1
+  barycentricRaster: 1
+  rasterMotionVectors: 1
+  rasterMotionDistance: 60
+  densityLodStart: 25
+  densityLodExponent: 3
+  densityLodMaxScale: 2
+  densityLodFade: 0.25
+  speedTreeWind: 1
+  shadowResolution: 2048
+  visibilityBuffer: 1
+  maxVisibilityBufferCameras: 4
+  resolveTileListFactor: 4
+  occlusionCulling: 1
+  occlusionListCapacity: 131072
+  occlusionFromMeshRenderers: 1
+  occluderAlphaTested: 0
+  softwareRaster: 1
+  swRasterThreshold: 32
+  shadowRaster: 1
+  shadowReceiverCulling: 1
+  shadowReceiverMarginTexels: 8
+  shadowReceiverMarginWorld: 0.5
+  shadowReceiverDepthChunks: 24
+  shadowRecordCapacity: 2097152
+  streaming: 1
+  streamingPoolMB: 512
+  streamingUploadMBPerFrame: 8
+  streamingLoadsInFlight: 64
+  streamingFeedbackCapacity: 16384
+  arenaVertexCapacity: 4194304
+  arenaIndexCapacity: 67108864
+  visibleClusterCapacity: 262144
+  nodeQueueCapacity: 1048576
+  groupItemCapacity: 524288
+  maxViewsPerFrame: 64
+  debugView: 0
+  disableConeCulling: 0
+  freezeCulling: 0
+  debugStopAfterStage: 0

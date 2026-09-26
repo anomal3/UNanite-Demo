@@ -1,0 +1,97 @@
+# UNanite — virtual geometry for Unity 6 (HDRP)
+
+Nanite-style virtualized geometry: offline cluster DAG builder, GPU-driven culling and LOD selection,
+rendering through HDRP's own passes via BatchRendererGroup. Status and measured numbers per
+milestone: [Documentation~/Milestones.md](Documentation~/Milestones.md). Design:
+[Documentation~/Architecture.md](Documentation~/Architecture.md). Binary layout:
+[Documentation~/DataFormat.md](Documentation~/DataFormat.md).
+
+## Quick start
+
+1. Select a model or mesh asset → tick **Virtual Geometry** in the inspector header (writes a
+   `.vgmesh` next to it; the importer builds the DAG, cached by the AssetDatabase).
+2. Select scene objects → **Tools/UNanite/Convert Selection to Virtual Geometry** (revert with
+   **Revert Selection to Mesh Renderers**). Or add **UNanite/Virtual Geometry Renderer** manually.
+3. Scene View overlay **UNanite** (or **Tools/UNanite/Debug View/**): Triangles, Clusters, Groups,
+   LOD Level, Instances, Materials; pixel error; visibility-buffer toggle; **Freeze** (culling stays
+   at the camera's current position while it moves: shows what was culled); per-view statistics
+   (`[VB]` marks views rendered through the visibility buffer, `[SR]` shadow splits drawn by the
+   shadow raster, `[RC -n]` shadow splits receiver-culled against the camera).
+
+Existing HDRP/Lit and Shader Graph materials work unmodified (they need the `DOTS_INSTANCING_ON`
+variant, which HDRP materials have). Main cameras (HDRP deferred) rasterise VG into a visibility
+buffer and shade opaque HDRP/Lit materials with a per-material resolve inside HDRP's GBuffer pass;
+other materials and views (forward cameras, reflection probes) use GPU vertex expansion. Those
+cameras also get two-phase HZB occlusion culling (previous-frame HZB, exact re-test of deferred work
+against the current frame; regular MeshRenderers occlude VG too) and a software rasteriser for
+small clusters (compute, 64-bit atomics, D3D12/Vulkan). Shadow maps draw VG from indices only with
+a vertex-pulling ShadowCaster pass, and shadow casters whose shadows cannot reach anything the
+camera sees are culled with the camera depth of the same frame (receiver culling).
+
+Geometry streams (M7): the GPU reports which pages its LOD cut wants, they are read from disk
+(`AsyncReadManager`) into a fixed page pool (`VirtualGeometrySettings.streamingPoolMB`, default
+512 MB) and evicted least-recently-used; only the small root pages of each mesh are always
+resident, and a missing page shows coarser detail, never a hole. Imported `.vgmesh` assets keep the
+streamable pages in a side file of the import artifact (copied to StreamingAssets for player
+builds). A `.vgmesh` can also describe a procedural rock (`VirtualGeometryImporter.CreateProceduralRock`)
+for test content without source meshes.
+
+Terrains (M8): select a Unity Terrain → **Tools/UNanite/Convert Selected Terrains to Virtual
+Geometry** (revert: **Revert Selected Terrains to Unity Terrain**). A `.vgterrain` sidecar next to
+the TerrainData builds an HLOD quadtree of VG tiles (borders locked at full resolution: crack-free
+across tiles and levels; the GPU picks one node per quadtree path per view), shaded with HDRP
+TerrainLit's layer blending and per-pixel heightmap normals. Trees, details and the TerrainCollider
+stay Unity's. `VirtualGeometryTerrain.SetHeights` / `ApplyCrater` edit at runtime: the affected
+tiles are rebuilt on a worker thread and swapped in together with the collider.
+
+Moving objects, destruction and ray tracing (M9):
+* Moving `VirtualGeometryRenderer`s get object motion vectors (TAA, motion blur) automatically.
+* *Ray Tracing Proxy Triangles* on a renderer: a hidden proxy mesh (DAG cut) in HDRP's ray tracing
+  acceleration structure.
+* A `.vgfracture` sidecar (JSON: source mesh or procedural rock, piece count, seed) imports a
+  Voronoi-fractured mesh; add **Virtual Geometry Destructible** next to the renderer and call
+  `Break(point, impulse)` (or let collisions break it). The source mesh must be closed.
+* Baked lightmaps: converted renderers keep the lightmap of their (disabled) MeshRenderer. Bake
+  before converting; all lightmaps must have one size and format.
+
+Shader Graphs and transparency (M10): **Tools/UNanite/Generate Shader Variants for Scene** writes
+a VG variant of every Shader Graph used by VG renderers (all passes pull their vertices from the page
+pool with the instance's object matrices; opaque graphs are shaded by the visibility-buffer resolve).
+Transparent instances are sorted like MeshRenderers.
+
+Foliage (M11): **Virtual Geometry Terrain Trees** / **Virtual Geometry Terrain Details** on a
+converted terrain draw its trees (the prefab's LODs with SpeedTree smooth LOD and LODGroup's animated
+crossfade into the billboard, SpeedTree 8 wind under the scene's WindZones) and its mesh details
+(density LOD: instances the details' shaders have faded out are dropped; `densityLodFadePoint`
+trades draw distance for speed) as virtual geometry. Alpha-tested and vertex-animated materials
+rasterise into the visibility buffer with their own vertex graph and alpha test; on D3D12 / Vulkan /
+Metal the raster also writes hardware barycentrics, so the resolve shades each foliage pixel without
+re-evaluating the vertex graph, and the motion vectors of the moved vertices (TAA, motion blur of
+swaying leaves).
+
+## Native builder
+
+`Native~/` (C++17, meshoptimizer 1.2, MIT). Build (Windows, VS 2019+ / CMake 3.20+):
+
+```
+cmake -S Native~ -B Native~/build -G "Visual Studio 16 2019" -A x64
+cmake --build Native~/build --config Release
+```
+
+The DLL is copied to `Plugins~/win-x64/` and loaded from a shadow copy, so it can be rebuilt while
+the editor runs; every `.vgmesh` re-imports automatically when the DLL changes.
+`Native~/build/Release/unanite_cli.exe rock 8 --runs 2` builds, decodes and crack-tests a 1.3M
+triangle procedural rock outside Unity.
+
+## Tests
+
+EditMode tests (`UNanite.Tests.Editor`): determinism across runs/thread counts, DAG monotonicity,
+per-level reduction, lossless source level, watertight LOD cuts (incl. partial page residency),
+1M-triangle build time, resolve-capability rules, visibility buffer vs expansion image comparison,
+occlusion image equality (moving camera and MeshRenderer occluder), software vs hardware raster
+image equality, shadow raster and receiver culling image equality, format v2 compression and
+tangent accuracy, the page residency manager under random feedback (with crack-free cuts of the
+resident sets), streamed rendering converging to the all-resident image, page files read from
+import artifacts, and (M8) terrain HLOD switches (monotonic, exactly one node per path), watertight
+terrain cuts across tiles and levels, runtime edits identical to a full rebuild, terrain rendering
+(1 px cut vs full detail, edits swapped in) and mesh replacement without dropping streamed pages.

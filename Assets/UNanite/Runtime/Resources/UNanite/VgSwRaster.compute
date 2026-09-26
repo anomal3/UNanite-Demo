@@ -1,0 +1,199 @@
+// M5 software rasteriser ("VG.RasterSW") for small clusters of visibility-buffer cameras.
+//
+//   ClearSW    VG_SwVisBuffer = 0 (far) for the camera's pixels, tile marks = 0
+//   RasterSW   one thread group per cluster of raster list 2 (VgCull.compute): vertices are decoded
+//              and projected once into group-shared memory, then one thread per triangle scans its
+//              pixel bounding box with 8.8 fixed-point edge functions (int64, inclusive coverage)
+//              and does InterlockedMax(depthKey << 32 | visibility id) per covered pixel.
+//
+//   MergeTiles compacts the 8x8 tiles marked by RasterSW into VG_SwTiles; MergeArgs writes the
+//              draw args, so VgSwMerge.shader only touches tiles that received software pixels
+//
+// depthKey = device depth with reversed Z (else 1 - depth), so "max" is "nearest"; the float bits
+// of a positive depth order like the float. VgSwMerge.shader writes the result into the visibility
+// buffer and the depth buffer with a regular depth test.
+// Uses the same view-projection as the hardware raster (HDRP's jittered, camera-relative matrix).
+// Requires DXC + SM 6.6 64-bit buffer atomics; VgWorld disables the path when unsupported.
+
+#pragma kernel ClearSW
+#pragma kernel RasterSW
+#pragma kernel MergeTiles
+#pragma kernel MergeArgs
+#pragma use_dxc
+#pragma require int64 int64bufferatomics
+#pragma only_renderers d3d11 vulkan
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/ShaderLibrary/ShaderVariables.hlsl"
+#include "../../ShaderLibrary/VgFormat.hlsl"
+
+StructuredBuffer<VgMeshGpu> VG_Meshes;
+StructuredBuffer<VgInstanceGpu> VG_Instances;
+StructuredBuffer<uint4> VG_Visible;
+StructuredBuffer<uint> VG_BinFlags;
+StructuredBuffer<uint> VG_RasterLists;
+StructuredBuffer<uint> VG_PhaseState;
+ByteAddressBuffer VG_PagePool;
+RWStructuredBuffer<uint64_t> VG_SwVisBuffer;
+RWStructuredBuffer<uint> VG_SwTileMask;    // per 8x8 tile: 1 = touched by the software raster
+RWStructuredBuffer<uint> VG_SwTiles;       // compacted tile list (x | y << 16)
+RWStructuredBuffer<uint> VG_SwMergeArgs;   // [0..3] IndirectDrawArgs of the merge, [4] tile count
+
+uint4 _SwConfig;   // x: first entry of the region's software list, y: phase state base, z: phase (0/1), w: row pitch (pixels)
+float4 _SwScreen;  // xy: screen size (pixels), z: reversed Z
+
+#define P_PHASE1_LIST_SW 6   // P_PHASE1_LIST + 2 (VgCull.compute)
+#define P_PHASE2_LIST_SW 9   // P_PHASE2_LIST + 2
+
+uint2 TileCounts()
+{
+    return (uint2(_SwConfig.w, (uint)_SwScreen.y) + 7) / 8;
+}
+
+[numthreads(64, 1, 1)]
+void ClearSW(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _SwConfig.w * (uint)_SwScreen.y)
+        VG_SwVisBuffer[id.x] = 0;
+    uint2 tiles = TileCounts();
+    if (id.x < tiles.x * tiles.y)
+        VG_SwTileMask[id.x] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void MergeTiles(uint3 id : SV_DispatchThreadID)
+{
+    uint2 tiles = TileCounts();
+    if (id.x >= tiles.x * tiles.y || VG_SwTileMask[id.x] == 0)
+        return;
+    uint at;
+    InterlockedAdd(VG_SwMergeArgs[4], 1, at);
+    VG_SwTiles[at] = (id.x % tiles.x) | ((id.x / tiles.x) << 16);
+}
+
+[numthreads(1, 1, 1)]
+void MergeArgs(uint3 id : SV_DispatchThreadID)
+{
+    uint tiles = VG_SwMergeArgs[4];
+    VG_SwMergeArgs[0] = tiles * 6;
+    VG_SwMergeArgs[1] = tiles > 0 ? 1 : 0;
+    VG_SwMergeArgs[2] = 0;
+    VG_SwMergeArgs[3] = 0;
+    VG_SwMergeArgs[4] = 0; // ready for the next MergeTiles
+}
+
+groupshared float4 gs_Screen[128];  // pixel x, pixel y, device depth, clip w
+groupshared float3 gs_Position[128]; // camera-relative world position
+
+int64_t Orient(int2 a, int2 b, int2 c)
+{
+    return (int64_t)(b.x - a.x) * (int64_t)(c.y - a.y) - (int64_t)(b.y - a.y) * (int64_t)(c.x - a.x);
+}
+
+[numthreads(128, 1, 1)]
+void RasterSW(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
+{
+    uint item = gid.y * 65535u + gid.x;
+    uint first = _SwConfig.z != 0 ? VG_PhaseState[_SwConfig.y + P_PHASE1_LIST_SW] : 0;
+    uint count = VG_PhaseState[_SwConfig.y + (_SwConfig.z != 0 ? P_PHASE2_LIST_SW : P_PHASE1_LIST_SW)];
+    bool active = item < count;
+
+    uint record = active ? VG_RasterLists[_SwConfig.x + first + item] : 0;
+    uint4 vis = VG_Visible[record];
+    VgInstanceGpu inst = VG_Instances[vis.x];
+    VgMeshGpu mesh = VG_Meshes[inst.meshIndex];
+    VgCluster c = VgLoadClusterGeometry(VG_PagePool, vis.y, vis.z);
+
+    if (active && gi < c.vertexCount)
+    {
+        float3 positionRWS = GetCameraRelativePositionWS(VgTransformPoint(inst, VgDecodePosition(VG_PagePool, c, gi, mesh)));
+        float4 clip = mul(UNITY_MATRIX_VP, float4(positionRWS, 1.0));
+        float3 ndc = clip.xyz / clip.w;
+        // D3D viewport mapping (y down), as the hardware raster
+        gs_Screen[gi] = float4((ndc.x * 0.5 + 0.5) * _SwScreen.x, (0.5 - ndc.y * 0.5) * _SwScreen.y, ndc.z, clip.w);
+        gs_Position[gi] = positionRWS;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!active || gi >= c.triangleCount)
+        return;
+
+    uint3 t = VgDecodeTriangle(VG_PagePool, c, gi);
+    float4 s0 = gs_Screen[t.x], s1 = gs_Screen[t.y], s2 = gs_Screen[t.z];
+    if (s0.w <= 0 || s1.w <= 0 || s2.w <= 0)
+        return; // classification keeps clusters in front of the near plane; stay safe
+
+    // back faces (world space, independent of projection flips); mirroring flips the winding
+    if ((VG_BinFlags[vis.w] & VG_BIN_DOUBLE_SIDED) == 0)
+    {
+        float3 p0 = gs_Position[t.x];
+        float3 viewDir = IsPerspectiveProjection() ? p0 : -UNITY_MATRIX_V[2].xyz;
+        bool front = (dot(cross(gs_Position[t.y] - p0, gs_Position[t.z] - p0), viewDir) < 0) != ((inst.flags & VG_INSTANCE_MIRRORED) != 0);
+        if (!front)
+            return;
+    }
+
+    // 8.8 fixed point
+    int2 a = (int2)round(s0.xy * 256.0);
+    int2 b = (int2)round(s1.xy * 256.0);
+    int2 d = (int2)round(s2.xy * 256.0);
+    float3 z = float3(s0.z, s1.z, s2.z);
+    int64_t area = Orient(a, b, d);
+    if (area == 0)
+        return;
+    if (area < 0)
+    {
+        int2 tmp = b; b = d; d = tmp;
+        z = z.xzy;
+        area = -area;
+    }
+
+    int2 lo = max(min(min(a, b), d) >> 8, int2(0, 0));
+    int2 hi = min(max(max(a, b), d) >> 8, int2(_SwScreen.xy) - 1);
+    if (hi.x < lo.x || hi.y < lo.y)
+        return;
+
+    // tiles for VgSwMerge (benign races: every writer stores 1)
+    uint tilesX = TileCounts().x;
+    for (int ty = lo.y >> 3; ty <= (hi.y >> 3); ++ty)
+        for (int tx = lo.x >> 3; tx <= (hi.x >> 3); ++tx)
+            VG_SwTileMask[ty * tilesX + tx] = 1;
+
+    float invArea = 1.0 / (float)area;
+    uint id = VgPackVisibility(record, gi);
+    bool reversedZ = _SwScreen.z != 0;
+    // edge functions at the first pixel centre, stepped incrementally (one pixel = 256 units)
+    int2 origin = int2(lo.x * 256 + 128, lo.y * 256 + 128);
+    int64_t row0 = Orient(b, d, origin);
+    int64_t row1 = Orient(d, a, origin);
+    int64_t row2 = Orient(a, b, origin);
+    int64_t dx0 = -(int64_t)(d.y - b.y) * 256, dy0 = (int64_t)(d.x - b.x) * 256;
+    int64_t dx1 = -(int64_t)(a.y - d.y) * 256, dy1 = (int64_t)(a.x - d.x) * 256;
+    int64_t dx2 = -(int64_t)(b.y - a.y) * 256, dy2 = (int64_t)(b.x - a.x) * 256;
+    for (int y = lo.y; y <= hi.y; ++y)
+    {
+        int64_t e0 = row0, e1 = row1, e2 = row2;
+        for (int x = lo.x; x <= hi.x; ++x)
+        {
+            if (e0 >= 0 && e1 >= 0 && e2 >= 0)
+            {
+                float depth = ((float)e0 * z.x + (float)e1 * z.y + (float)e2 * z.z) * invArea;
+                float key = reversedZ ? depth : 1.0 - depth;
+                if (depth >= 0 && depth <= 1 && key > 0)
+                {
+                    uint64_t value = ((uint64_t)asuint(key) << 32) | (uint64_t)id;
+                    uint index = y * _SwConfig.w + x;
+                    // plain read first: most covered pixels of an overdrawn area lose, skip their atomic
+                    if (VG_SwVisBuffer[index] < value)
+                        InterlockedMax(VG_SwVisBuffer[index], value);
+                }
+            }
+            e0 += dx0;
+            e1 += dx1;
+            e2 += dx2;
+        }
+        row0 += dy0;
+        row1 += dy1;
+        row2 += dy2;
+    }
+}

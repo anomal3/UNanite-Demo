@@ -1,0 +1,137 @@
+// M3 material classification ("VG.Classify"): 8x8 pixel tiles of the visibility buffer are
+// binned by material so each material bin's resolve draw only covers tiles it owns.
+//
+//   ClearBins      zero per-bin counters
+//   CountTiles     per tile: unique bins present -> VG_BinTileCount[bin]++
+//   AllocateTiles  prefix sum over bins -> VG_BinTileOffset, procedural indirect args per bin
+//   WriteTiles     per tile: append (tile, bin) to the bin's range of VG_TileList
+//
+// VG_ResolveArgs (per bin, GraphicsBuffer.IndirectDrawArgs): vertexCount = tiles * 6,
+// instanceCount = tiles > 0, startVertex = startInstance = 0. startVertex is not used to address
+// the tile list: whether SV_VertexID includes it differs between graphics APIs and BRG paths
+// (measured: it does not on D3D12 BRG procedural draws). The resolve vertex shader finds its bin
+// through the draw's DOTS visibleOffset instead and reads VG_BinTileOffset[bin].
+// VG_TileList entries: uint2(tileX | tileY << 16, bin).
+
+#pragma kernel ClearBins
+#pragma kernel CountTiles
+#pragma kernel AllocateTiles
+#pragma kernel WriteTiles
+
+#include "../../ShaderLibrary/VgFormat.hlsl"
+
+Texture2DArray<uint2> _VgVisBuffer;
+StructuredBuffer<uint4> VG_Visible;
+RWStructuredBuffer<uint> VG_BinTileCount;
+RWStructuredBuffer<uint> VG_BinTileOffset;
+RWStructuredBuffer<uint> VG_BinTileCursor;
+RWStructuredBuffer<uint> VG_ResolveArgs;
+RWStructuredBuffer<uint2> VG_TileList;
+RWStructuredBuffer<uint> VG_ClassifyStats; // x: tiles written, y: overflow
+
+uint4 _ClassifyParams; // x: width, y: height, z: bin count, w: tile list capacity
+
+#define NO_BIN 0xFFFFFFFFu
+
+groupshared uint gs_Bins[64];
+groupshared uint gs_Mixed;
+
+uint PixelBin(uint2 pixel)
+{
+    if (pixel.x >= _ClassifyParams.x || pixel.y >= _ClassifyParams.y)
+        return NO_BIN;
+    uint packed = _VgVisBuffer.Load(int4(pixel, 0, 0)).x;
+    if (packed == 0)
+        return NO_BIN;
+    uint record, triIndex;
+    VgUnpackVisibility(packed, record, triIndex);
+    return VG_Visible[record].w;
+}
+
+// Returns the pixel's bin if this thread represents it for the tile (one thread per unique bin),
+// else NO_BIN. Fast path: every pixel holds the first pixel's bin (most tiles) -> thread 0 only.
+// Otherwise each thread scans the pixels before it (O(64), only on material / sky edges).
+uint UniqueTileBin(uint2 pixel, uint gi)
+{
+    uint bin = PixelBin(pixel);
+    gs_Bins[gi] = bin;
+    if (gi == 0)
+        gs_Mixed = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint first = gs_Bins[0];
+    if (bin != first)
+        gs_Mixed = 1;
+    GroupMemoryBarrierWithGroupSync();
+    if (gs_Mixed == 0)
+        return gi == 0 ? first : NO_BIN;
+    if (bin != NO_BIN)
+    {
+        for (uint j = 0; j < gi; ++j)
+        {
+            if (gs_Bins[j] == bin)
+            {
+                bin = NO_BIN;
+                break;
+            }
+        }
+    }
+    return bin;
+}
+
+[numthreads(64, 1, 1)]
+void ClearBins(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _ClassifyParams.z)
+    {
+        VG_BinTileCount[id.x] = 0;
+        VG_BinTileCursor[id.x] = 0;
+    }
+    if (id.x < 2)
+        VG_ClassifyStats[id.x] = 0;
+}
+
+[numthreads(8, 8, 1)]
+void CountTiles(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    uint bin = UniqueTileBin(gid.xy * 8 + gtid.xy, gi);
+    if (bin < _ClassifyParams.z)
+        InterlockedAdd(VG_BinTileCount[bin], 1);
+}
+
+[numthreads(1, 1, 1)]
+void AllocateTiles(uint3 id : SV_DispatchThreadID)
+{
+    uint offset = 0;
+    uint overflow = 0;
+    for (uint b = 0; b < _ClassifyParams.z; ++b)
+    {
+        uint n = VG_BinTileCount[b];
+        if (offset + n > _ClassifyParams.w)
+        {
+            overflow = 1;
+            n = _ClassifyParams.w - offset;
+        }
+        VG_BinTileCount[b] = n;
+        VG_BinTileOffset[b] = offset;
+        uint a = b * 4;
+        VG_ResolveArgs[a + 0] = n * 6;
+        VG_ResolveArgs[a + 1] = n > 0 ? 1 : 0;
+        VG_ResolveArgs[a + 2] = 0;
+        VG_ResolveArgs[a + 3] = 0;
+        offset += n;
+    }
+    VG_ClassifyStats[0] = offset;
+    VG_ClassifyStats[1] = overflow;
+}
+
+[numthreads(8, 8, 1)]
+void WriteTiles(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)
+{
+    uint bin = UniqueTileBin(gid.xy * 8 + gtid.xy, gi);
+    if (bin >= _ClassifyParams.z)
+        return;
+    uint at;
+    InterlockedAdd(VG_BinTileCursor[bin], 1, at);
+    if (at < VG_BinTileCount[bin])
+        VG_TileList[VG_BinTileOffset[bin] + at] = uint2(gid.x | (gid.y << 16), bin);
+}
