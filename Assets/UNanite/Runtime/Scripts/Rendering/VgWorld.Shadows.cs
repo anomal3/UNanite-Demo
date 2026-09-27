@@ -151,9 +151,9 @@ namespace UNanite
 
         void DisposeShadows()
         {
-            foreach (var b in new[] { m_ShadowRecords, m_ShadowViews, m_TileDepth, m_RcvSplat, m_Receivers.hzb })
+            foreach (var b in new[] { m_ShadowRecords, m_ShadowViews, m_TileDepth, m_RcvSplat, m_Receivers.hzb, m_ShadowDummySwitches })
                 b?.Dispose();
-            m_ShadowRecords = m_ShadowViews = m_TileDepth = m_RcvSplat = m_Receivers.hzb = null;
+            m_ShadowRecords = m_ShadowViews = m_TileDepth = m_RcvSplat = m_Receivers.hzb = m_ShadowDummySwitches = null;
             for (int i = 0; i < 2; ++i)
                 if (m_ShadowMaterials[i] != null)
                     CoreUtils.Destroy(m_ShadowMaterials[i]);
@@ -217,7 +217,16 @@ namespace UNanite
             Shader.SetGlobalBuffer(VisIds.PagePool, m_PagePool);
             Shader.SetGlobalBuffer(ShadowIds.ShadowRecords, m_ShadowRecords);
             Shader.SetGlobalBuffer(ShadowIds.ShadowViews, m_ShadowViews);
+            // caster LOD error (VgShadowRaster.shader CasterError): group errors, HLOD switch errors
+            Shader.SetGlobalBuffer(Ids.Groups, m_GroupBuffer);
+            Shader.SetGlobalBuffer(s_LodSwitchesId, m_LodSwitchBuffer ?? ShadowDummySwitches());
         }
+
+        GraphicsBuffer m_ShadowDummySwitches;
+
+        // a bound VG_LodSwitches while no HLOD instance registered one (never read then: lodSelf is invalid)
+        GraphicsBuffer ShadowDummySwitches() =>
+            m_ShadowDummySwitches ??= new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, VgLodSwitchGpu.Stride);
 
         void PruneShadowCameras()
         {

@@ -26,7 +26,7 @@ Everything is on the [Releases](https://github.com/anomal3/UNanite-Demo/releases
 | `UNanite_0.11.2-preview.pdf` | Plugin description and manual |
 | `UNaniteDemo_Scene.unitypackage` | Only the demo scene with its assets (import after the plugin) |
 
-The release files are still version 0.11.2-preview. The repository itself already has the plugin **0.13.0-preview**
+The release files are still version 0.11.2-preview. The repository itself already has the plugin **0.13.2-preview**
 (see "What is new" below), a new release with the build will come later.
 
 Or clone this repository and open it with **Unity 6000.4.4f1** (the plugin is already inside, in `Assets/UNanite`).
@@ -65,7 +65,58 @@ In scenes that already have good LODs the difference is much smaller.
 | **C** | clear the rocks |
 | F2 | stats, F1 / Esc - help window, F10 - quit |
 
-## What is new in 0.13.0-preview (in the repository, not yet in the release files)
+## What is new in 0.13.2-preview (in the repository, not yet in the release files)
+
+- **Scene Setup window** - **Tools > UNanite > Scene Setup**. It scans all open scenes and shows every renderer:
+  is it already virtual geometry, can it be converted, or why it stay a regular Unity renderer (skinned mesh, coarser
+  LOD, transparent material, mesh that is not an asset of the project...). For every object you see the triangles,
+  how its shadow is drawn and which way every material goes (visibility buffer resolve, vertex expansion, Shader Graph
+  variant). You select the rows you want and convert or revert exactly them, with undo. Before this window you just
+  press "Convert" and hope that everything went fine.
+
+![Scene Setup](Docs/images/10_scene_setup_all.png)
+
+| Skipped objects and the reason | Objects that can be converted |
+|---|---|
+| ![Skipped](Docs/images/11_scene_setup_skipped.png) | ![Convertible](Docs/images/12_scene_setup_convertible.png) |
+
+- **Presets in the settings.** The UNanite settings inspector have Quality / Balanced / Performance buttons now, and
+  it checks the project and tell you when something is wrong (dynamic resolution forced by the HDRP asset, a graphics
+  API without the software raster, experimental options that are switched on).
+- **Foliage keeps its LODs.** Bushes and plants with alpha-tested leaves was losing their leaves, because the automatic
+  simplification removed whole leaf cards. Now a LODGroup with foliage is converted with all its LODs, every LOD
+  without simplification, and UNanite switches them at the same distance where Unity does it (new component
+  *Virtual Geometry LOD Group*).
+- **Fix for Unity 6 Mesh LOD.** When a model is imported with the automatic Mesh LOD of Unity 6, UNanite built all its
+  LODs on top of each other. Now it takes only LOD0.
+- **Fix for terrain shadows.** Big false shadows on sunny hills of virtual geometry terrain are gone.
+- **New sample: Quarry Scene** (`Assets/UNanite/Samples~/QuarryScene`, HDRP). It imports a folder of Megascans
+  downloads from Fab (the zip files like you download them) and builds a big slate quarry from them: rock faces on
+  the walls, scree, boulders, bushes and grass, a brick ruin, a worker camp. Press **V** to compare with Unity
+  rendering, **P** for a fly-through. I make it with 57 free Fab assets: 9 246 objects and 249 million triangles.
+
+  RTX 3060, 1920x1080, DX12, native resolution, GPU time (median):
+
+  | View | UNanite | Unity + Mesh LOD | Unity without LOD |
+  |---|---|---|---|
+  | Overview | **8.1 ms** | 13.3 ms | 49.5 ms |
+  | Camp | **6.8 ms** | 10.0 ms | 18.4 ms |
+  | Wall and scree | **6.4 ms** | 10.3 ms | 17.6 ms |
+  | Ruin | **6.2 ms** | 12.0 ms | 43.8 ms |
+  | Channel | **6.6 ms** | 11.5 ms | 45.8 ms |
+
+  Unity needs 9 000 - 25 000 draw calls for this scene, UNanite 135. The Megascans files are not in this repository
+  (the Fab license don't allow to share the files itself), but the sample README lists every asset I used, so you can
+  download the same free ones and build the same scene with one button.
+
+![Quarry, overview: Unity left, UNanite right](Docs/images/13_quarry_overview.jpg)
+![Quarry, camp: Unity left, UNanite right](Docs/images/14_quarry_camp.jpg)
+
+- **Data format documentation** is here now: [Docs/DataFormat.md](Docs/DataFormat.md) - how the clusters, pages and
+  the compression are stored.
+- 46 of 47 editor tests pass (the ray tracing test needs a quality level with ray tracing).
+
+## What is new in 0.13.0-preview
 
 - **URP: basic support (experimental).** UNanite now runs in URP 17 too, but only with the simpler draw path: no
   visibility buffer, no occlusion culling and no special shadow raster, this things are HDRP only for now. I tested
@@ -83,7 +134,8 @@ In scenes that already have good LODs the difference is much smaller.
 
 ## What is working
 
-- Conversion of MeshRenderers (and LOD0 of LODGroups) to virtual geometry with one menu command
+- Conversion of MeshRenderers (LOD0 of LODGroups, foliage keeps all its LODs) to virtual geometry with one menu
+  command or in the Scene Setup window
 - Cluster DAG with automatic LOD, GPU culling with two-pass occlusion, visibility buffer, software raster for tiny triangles
 - HDRP/Lit and most Lit Shader Graphs, transparent parts of mixed objects
 - Shadows, baked lightmaps, motion vectors, ray tracing proxies
@@ -99,10 +151,12 @@ Vulkan and AMD cards are not tested. I tested it only on RTX 3060, so if you wil
 
 1. Unity 6000.4 with HDRP 17.4.
 2. Import `UNanite_0.11.2-preview.unitypackage`, a welcome window will open (you can switch it off at the bottom).
-3. Select objects in the scene: **Tools > UNanite > Convert Selection to Virtual Geometry**.
+3. Open **Tools > UNanite > Scene Setup**: it shows what can be converted. Select the rows and press Convert (or
+   select objects in the scene and use **Tools > UNanite > Convert Selection to Virtual Geometry**).
 4. Press Play. Debug views are in the UNanite overlay of the Scene view.
 
-More details are in the PDF on the Releases page.
+More details are in the PDF on the Releases page. How the geometry data is stored (clusters, pages, compression):
+[Docs/DataFormat.md](Docs/DataFormat.md).
 
 ## About me and the project
 

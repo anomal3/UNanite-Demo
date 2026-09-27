@@ -96,7 +96,7 @@ namespace UNanite.Editor
                 var lods = lodGroup != null && lodGroup.lodCount > 0 ? lodGroup.GetLODs() : null;
                 // foliage (alpha-tested cards thin out when simplified): the prefab's own LODs as
                 // discrete levels of unsimplified clusters; everything else: LOD0 with the cluster DAG
-                bool foliage = lods != null && lods.Length > 1 && lods.Any(l => l.renderers.Any(r => r != null && r.sharedMaterials.Any(IsAlphaTested)));
+                bool foliage = lods != null && lods.Length > 1 && lods.Any(l => l.renderers.Any(r => r != null && r.sharedMaterials.Any(VirtualGeometryConverter.IsAlphaTested)));
                 int levels = foliage ? lods.Length : 1;
                 int before = renderers.Count;
                 for (int l = 0; l < levels; ++l)
@@ -207,9 +207,6 @@ namespace UNanite.Editor
             EditorUtility.SetDirty(terrain);
             return details;
         }
-
-        static bool IsAlphaTested(Material m) =>
-            m != null && (m.IsKeywordEnabled("_ALPHATEST_ON") || (m.renderQueue >= (int)UnityEngine.Rendering.RenderQueue.AlphaTest && m.renderQueue <= (int)UnityEngine.Rendering.RenderQueue.GeometryLast));
 
         public static void Revert(Terrain terrain)
         {

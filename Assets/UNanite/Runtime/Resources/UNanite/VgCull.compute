@@ -404,7 +404,12 @@ bool IsOccluded(float3 center, float radius)
 
 bool OcclusionTested(VgInstanceGpu inst)
 {
-    return _OccConfig.x == 3 || (_OccConfig.x != 0 && (inst.flags & VG_INSTANCE_OCCLUDABLE) != 0);
+    // M14: HLOD instances (terrain tiles) are never receiver-culled. They are the main receivers
+    // themselves, and culling their fine nodes kept those pages from being requested by the split:
+    // non-resident, the coarse root fans of the tiles cast instead and shadowed whole sunlit slopes.
+    if (_OccConfig.x == 3)
+        return inst.lodSelf == VG_INVALID && inst.lodParent == VG_INVALID;
+    return _OccConfig.x != 0 && (inst.flags & VG_INSTANCE_OCCLUDABLE) != 0;
 }
 
 // Appends to a deferred list. Returns false when the list is full: the caller then treats the item

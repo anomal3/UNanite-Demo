@@ -1,0 +1,20 @@
+{
+    "name": "UNanite.Samples.QuarryScene",
+    "rootNamespace": "UNanite.Samples.QuarryScene",
+    "references": [
+        "UNanite.Runtime",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.InputSystem"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        { "name": "com.unity.inputsystem", "expression": "1.0.0", "define": "UNANITE_SAMPLE_INPUT_SYSTEM" }
+    ],
+    "noEngineReferences": false
+}

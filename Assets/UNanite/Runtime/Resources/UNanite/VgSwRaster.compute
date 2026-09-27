@@ -50,14 +50,15 @@ uint2 TileCounts()
     return (uint2(_SwConfig.w, (uint)_SwScreen.y) + 7) / 8;
 }
 
-[numthreads(64, 1, 1)]
-void ClearSW(uint3 id : SV_DispatchThreadID)
+// one thread group per 8x8 tile (2D: a 1D dispatch over the pixels passes 65535 groups at 4K)
+[numthreads(8, 8, 1)]
+void ClearSW(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
 {
-    if (id.x < _SwConfig.w * (uint)_SwScreen.y)
-        VG_SwVisBuffer[id.x] = 0;
+    if (id.x < _SwConfig.w && id.y < (uint)_SwScreen.y)
+        VG_SwVisBuffer[id.y * _SwConfig.w + id.x] = 0;
     uint2 tiles = TileCounts();
-    if (id.x < tiles.x * tiles.y)
-        VG_SwTileMask[id.x] = 0;
+    if (gi == 0 && all(gid.xy < tiles))
+        VG_SwTileMask[gid.y * tiles.x + gid.x] = 0;
 }
 
 [numthreads(64, 1, 1)]

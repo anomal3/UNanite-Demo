@@ -1,0 +1,23 @@
+{
+    "name": "UNanite.Samples.QuarryScene.Editor",
+    "rootNamespace": "UNanite.Samples.QuarryScene",
+    "references": [
+        "UNanite.Runtime",
+        "UNanite.Editor",
+        "UNanite.Samples.QuarryScene",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.RenderPipelines.HighDefinition.Runtime",
+        "Unity.Collections"
+    ],
+    "includePlatforms": ["Editor"],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": ["UNANITE_SAMPLE_HDRP"],
+    "versionDefines": [
+        { "name": "com.unity.render-pipelines.high-definition", "expression": "17.0.0", "define": "UNANITE_SAMPLE_HDRP" }
+    ],
+    "noEngineReferences": false
+}

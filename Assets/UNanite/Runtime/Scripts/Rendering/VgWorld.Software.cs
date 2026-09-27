@@ -152,7 +152,7 @@ namespace UNanite
                 cmd.SetComputeBufferParam(m_SwCs, k, SwIds.SwMergeArgs, m_SwMergeArgs);
             }
             if (phase == 0)
-                cmd.DispatchCompute(m_SwCs, k_SwClear, (Mathf.Max(pixels, tiles) + 63) / 64, 1, 1);
+                cmd.DispatchCompute(m_SwCs, k_SwClear, (width + 7) / 8, (height + 7) / 8, 1);
             cmd.SetComputeBufferParam(m_SwCs, k_SwRaster, SwIds.RasterLists, m_RasterLists);
             cmd.SetComputeBufferParam(m_SwCs, k_SwRaster, Ids.PhaseState, m_PhaseState);
             cmd.SetComputeBufferParam(m_SwCs, k_SwRaster, Ids.Visible, m_Visible);

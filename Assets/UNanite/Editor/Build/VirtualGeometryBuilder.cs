@@ -171,9 +171,18 @@ namespace UNanite.Editor
                 }
                 using var idx = new NativeArray<int>(desc.indexCount, Allocator.Temp);
                 data.GetIndices(idx, s, true);
-                for (int i = 0; i < idx.Length; ++i)
+                // Unity 6 Mesh LOD (ModelImporter.generateMeshLods): a submesh holds the indices of every LOD,
+                // ranges relative to its start; virtual geometry builds its own hierarchy from LOD0 only
+                int first = 0, count = idx.Length;
+                if (mesh.lodCount > 1)
+                {
+                    var lod0 = mesh.GetLod(s, 0);
+                    first = Mathf.Clamp((int)lod0.indexStart, 0, idx.Length);
+                    count = Mathf.Clamp((int)lod0.indexCount, 0, idx.Length - first);
+                }
+                for (int i = first; i < first + count; ++i)
                     indices.Add((uint)idx[i]);
-                for (int t = 0; t < idx.Length / 3; ++t)
+                for (int t = 0; t < count / 3; ++t)
                     materials.Add((uint)s);
             }
             streams.indices = indices.ToArray();

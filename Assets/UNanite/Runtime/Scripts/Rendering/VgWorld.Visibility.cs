@@ -637,7 +637,8 @@ namespace UNanite
 
     /// <summary>Global HDRP custom pass (AfterOpaqueDepthAndNormal), with the complete opaque depth
     /// (VG + regular meshes): HZB for the next frame's phase-1 occlusion test (M4), receiver
-    /// culling of the shadow splits deferred to this camera (M6; HDRP renders shadow maps later).</summary>
+    /// culling of the shadow splits deferred to this camera (M6; HDRP renders shadow maps later),
+    /// the sun shadow clipmap (M13b; HDRP's lighting reads it later through the optional patch).</summary>
     sealed class VgOcclusionHistoryPass : CustomPass
     {
         protected override void Execute(CustomPassContext ctx)
@@ -647,6 +648,7 @@ namespace UNanite
                 return;
             world.RenderOcclusionHistory(ctx);
             world.RenderDeferredShadows(ctx);
+            world.RenderSunClipmap(ctx); // M13b
         }
     }
 #endif

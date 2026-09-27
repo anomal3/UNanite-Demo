@@ -147,7 +147,10 @@ namespace UNanite
                     continue;
                 var r = s_Renderers[i];
                 if (r != null && r.IsRegistered)
+                {
                     world.ApplyTransform(r.Handle, output[i]);
+                    r.OnTransformApplied();
+                }
             }
         }
     }

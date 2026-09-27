@@ -9,7 +9,8 @@ namespace UNanite.Editor
     /// <summary>
     /// Scene converter: MeshRenderer/MeshFilter (and LODGroup LOD0) → VirtualGeometryRenderer, keeping
     /// the original renderer disabled on the same GameObject so the change is revertible and the
-    /// renderer serves as the fallback on unsupported devices.
+    /// renderer serves as the fallback on unsupported devices. Foliage LODGroups (alpha-tested LOD0)
+    /// keep every LOD, drawn as discrete virtual geometry LODs (VirtualGeometryLodGroup, M14).
     /// </summary>
     public static class VirtualGeometryConverter
     {
@@ -45,11 +46,14 @@ namespace UNanite.Editor
             int converted = 0;
             var filters = roots.SelectMany(r => r.GetComponentsInChildren<MeshFilter>(true)).Distinct().ToList();
 
-            // LODGroups: keep only LOD0 renderers; the others become redundant (VG handles LOD)
+            // LODGroups: keep only LOD0 renderers; the others become redundant (VG handles LOD). Foliage
+            // groups convert every LOD (discrete LODs, see UsesDiscreteLods)
             var lodGroups = roots.SelectMany(r => r.GetComponentsInChildren<LODGroup>(true)).Distinct().ToList();
             var coarserLods = new HashSet<Renderer>();
             foreach (var g in lodGroups)
             {
+                if (UsesDiscreteLods(g))
+                    continue;
                 var lods = g.GetLODs();
                 for (int l = 1; l < lods.Length; ++l)
                     foreach (var r in lods[l].renderers)
@@ -78,36 +82,216 @@ namespace UNanite.Editor
                     skipped.Add($"{mf.name} (transparent material)");
                     continue;
                 }
-                var vg = FindOrCreateVirtualGeometry(mf.sharedMesh, out string reason);
-                if (vg == null)
-                {
-                    skipped.Add($"{mf.name} ({reason})");
-                    continue;
-                }
-
-                var vgr = Undo.AddComponent<VirtualGeometryRenderer>(mf.gameObject);
-                vgr.Mesh = vg;
-                vgr.SharedMaterials = mr.sharedMaterials;
-                vgr.ShadowCasting = mr.shadowCastingMode;
-                Undo.RecordObject(mr, "Disable renderer");
-                mr.enabled = false;
-                converted++;
-                foreach (var m in mr.sharedMaterials)
-                    if (m != null && VgShaderVariantGenerator.CanGenerate(m.shader))
-                        graphs.Add(m.shader);
+                if (ConvertOne(mf, mr, skipped, graphs))
+                    converted++;
             }
             // M10: Shader Graph materials draw through generated VG variants of their shader
             foreach (var shader in graphs)
                 VgShaderVariantGenerator.GetOrCreate(shader, out _);
 
             foreach (var g in lodGroups)
-            {
-                Undo.RecordObject(g, "Disable LODGroup");
-                g.enabled = false;
-            }
+                DisableLodGroup(g);
 
             Undo.CollapseUndoOperations(group);
             return converted;
+        }
+
+        /// <summary>
+        /// M14: a LODGroup whose LOD0 is alpha-tested (foliage) keeps its LODs: its renderers are built
+        /// without simplification, so each LOD is converted and drawn as a discrete virtual geometry LOD
+        /// (VirtualGeometryLodGroup) instead of the cluster DAG taking over from LOD0.
+        /// </summary>
+        public static bool UsesDiscreteLods(LODGroup group)
+        {
+            if (group == null || group.lodCount < 2)
+                return false;
+            var lod0 = group.GetLODs()[0].renderers;
+            return lod0 != null && lod0.Any(r => r != null && r.sharedMaterials.Any(IsAlphaTested));
+        }
+
+        // after its renderers were converted: VG draws the LODs (discrete ones through a VirtualGeometryLodGroup)
+        static void DisableLodGroup(LODGroup g)
+        {
+            if (UsesDiscreteLods(g))
+            {
+                // LOD renderers that could not be converted would draw at every distance with the group off
+                foreach (var lod in g.GetLODs())
+                    foreach (var r in lod.renderers)
+                        if (r != null && r.enabled && r.GetComponent<VirtualGeometryRenderer>() == null)
+                        {
+                            Undo.RecordObject(r, "Disable LOD renderer");
+                            r.enabled = false;
+                        }
+                if (g.GetComponent<VirtualGeometryLodGroup>() == null)
+                    Undo.AddComponent<VirtualGeometryLodGroup>(g.gameObject);
+            }
+            Undo.RecordObject(g, "Disable LODGroup");
+            g.enabled = false;
+        }
+
+        // the LODGroup draws again: its discrete-LOD component goes
+        static void RemoveLodGroup(LODGroup g)
+        {
+            var discrete = g.GetComponent<VirtualGeometryLodGroup>();
+            if (discrete != null)
+                Undo.DestroyObjectImmediate(discrete);
+        }
+
+        // one MeshRenderer -> VirtualGeometryRenderer (undo), its Shader Graphs collected for variant generation.
+        // Foliage (alpha-tested materials): source clusters only - simplifying alpha-tested cards removes
+        // them (their small geometric error lets the DAG drop whole leaves even up close); M11 terrain
+        // trees do the same with the prefab's own LODs as discrete levels.
+        static bool ConvertOne(MeshFilter mf, MeshRenderer mr, List<string> skipped, HashSet<Shader> graphs)
+        {
+            var vg = FindOrCreateVirtualGeometry(mf.sharedMesh, mr.sharedMaterials.Any(IsAlphaTested), out string reason);
+            if (vg == null)
+            {
+                skipped.Add($"{mf.name} ({reason})");
+                return false;
+            }
+            var vgr = Undo.AddComponent<VirtualGeometryRenderer>(mf.gameObject);
+            vgr.Mesh = vg;
+            vgr.SharedMaterials = mr.sharedMaterials;
+            vgr.ShadowCasting = mr.shadowCastingMode;
+            Undo.RecordObject(mr, "Disable renderer");
+            mr.enabled = false;
+            foreach (var m in mr.sharedMaterials)
+                if (m != null && VgShaderVariantGenerator.CanGenerate(m.shader))
+                    graphs.Add(m.shader);
+            return true;
+        }
+
+        /// <summary>
+        /// M14: converts exactly these renderers (not their children). A renderer in LOD0 of a LODGroup also
+        /// disables the group and its coarser LODs (virtual geometry does the LOD); coarser-LOD renderers are
+        /// skipped. A renderer of a foliage group (UsesDiscreteLods) converts every LOD of the group.
+        /// Transparent-only renderers are skipped when `skipTransparent`.
+        /// </summary>
+        public static int ConvertRenderers(IEnumerable<MeshRenderer> renderers, out List<string> skipped, bool skipTransparent = false)
+        {
+            skipped = new List<string>();
+            int converted = 0;
+            var graphs = new HashSet<Shader>();
+            var groups = new HashSet<LODGroup>();
+            Undo.SetCurrentGroupName("Convert to Virtual Geometry");
+            int undoGroup = Undo.GetCurrentGroup();
+            var list = renderers.Where(r => r != null).Distinct().ToList();
+            // a renderer of a foliage group brings the group's other LODs (all drawn as discrete LODs)
+            var listed = new HashSet<MeshRenderer>(list);
+            var discreteGroups = list.Select(r => (r, g: r.GetComponentInParent<LODGroup>(true)))
+                                     .Where(x => LodIndexOf(x.g, x.r) >= 0 && UsesDiscreteLods(x.g))
+                                     .Select(x => x.g).Distinct().ToList();
+            foreach (var g in discreteGroups)
+                foreach (var lod in g.GetLODs())
+                    foreach (var r in lod.renderers.OfType<MeshRenderer>())
+                        if (listed.Add(r))
+                            list.Add(r);
+            foreach (var mr in list)
+            {
+                var mf = mr.GetComponent<MeshFilter>();
+                if (mf == null || mf.sharedMesh == null || mr.GetComponent<VirtualGeometryRenderer>() != null)
+                    continue;
+                var lodGroup = mr.GetComponentInParent<LODGroup>(true);
+                int lod = LodIndexOf(lodGroup, mr);
+                if (lod > 0 && !UsesDiscreteLods(lodGroup))
+                {
+                    skipped.Add($"{mr.name} (coarser LOD of {lodGroup.name})");
+                    continue;
+                }
+                if (skipTransparent && mr.sharedMaterials.All(m => m == null || m.renderQueue > (int)UnityEngine.Rendering.RenderQueue.GeometryLast))
+                {
+                    skipped.Add($"{mr.name} (transparent material)");
+                    continue;
+                }
+                if (!ConvertOne(mf, mr, skipped, graphs))
+                    continue;
+                converted++;
+                if (lod >= 0)
+                    groups.Add(lodGroup);
+            }
+            foreach (var g in groups)
+            {
+                if (!UsesDiscreteLods(g))
+                {
+                    var lods = g.GetLODs();
+                    for (int l = 1; l < lods.Length; ++l)
+                        foreach (var r in lods[l].renderers)
+                            if (r != null && r.enabled)
+                            {
+                                Undo.RecordObject(r, "Disable coarse LOD");
+                                r.enabled = false;
+                            }
+                }
+                DisableLodGroup(g);
+            }
+            foreach (var shader in graphs)
+                VgShaderVariantGenerator.GetOrCreate(shader, out _);
+            Undo.CollapseUndoOperations(undoGroup);
+            return converted;
+        }
+
+        /// <summary>Alpha clip on (keyword or an alpha-test render queue): foliage, fences.</summary>
+        public static bool IsAlphaTested(Material m) =>
+            m != null && (m.IsKeywordEnabled("_ALPHATEST_ON") ||
+                          (m.renderQueue >= (int)UnityEngine.Rendering.RenderQueue.AlphaTest && m.renderQueue <= (int)UnityEngine.Rendering.RenderQueue.GeometryLast));
+
+        /// <summary>LOD index of `renderer` in `group` (-1: not in it or no group).</summary>
+        public static int LodIndexOf(LODGroup group, Renderer renderer)
+        {
+            if (group == null)
+                return -1;
+            var lods = group.GetLODs();
+            for (int l = 0; l < lods.Length; ++l)
+                if (lods[l].renderers != null && System.Array.IndexOf(lods[l].renderers, renderer) >= 0)
+                    return l;
+            return -1;
+        }
+
+        /// <summary>
+        /// M14: reverts exactly these virtual geometry renderers (their LODGroups come back too; a renderer
+        /// of a discrete-LOD group reverts the whole group).
+        /// </summary>
+        public static int RevertRenderers(IEnumerable<VirtualGeometryRenderer> renderers)
+        {
+            var list = renderers.Where(r => r != null).Distinct().ToList();
+            var listed = new HashSet<VirtualGeometryRenderer>(list);
+            foreach (var d in list.Select(r => r.GetComponentInParent<VirtualGeometryLodGroup>(true)).Where(d => d != null).Distinct().ToList())
+                foreach (var lod in d.Group.GetLODs())
+                    foreach (var r in lod.renderers)
+                        if (r != null && r.TryGetComponent<VirtualGeometryRenderer>(out var vgr) && listed.Add(vgr))
+                            list.Add(vgr);
+            Undo.SetCurrentGroupName("Revert Virtual Geometry");
+            int undoGroup = Undo.GetCurrentGroup();
+            var groups = new HashSet<LODGroup>();
+            foreach (var vgr in list)
+            {
+                var mr = vgr.GetComponent<MeshRenderer>();
+                if (mr != null)
+                {
+                    Undo.RecordObject(mr, "Enable renderer");
+                    mr.enabled = true;
+                    var g = mr.GetComponentInParent<LODGroup>(true);
+                    int lod = LodIndexOf(g, mr);
+                    if (lod == 0 || (lod > 0 && g.GetComponent<VirtualGeometryLodGroup>() != null))
+                        groups.Add(g);
+                }
+                Undo.DestroyObjectImmediate(vgr);
+            }
+            foreach (var g in groups)
+            {
+                RemoveLodGroup(g);
+                Undo.RecordObject(g, "Enable LODGroup");
+                g.enabled = true;
+                foreach (var lod in g.GetLODs())
+                    foreach (var r in lod.renderers)
+                        if (r != null && r.GetComponent<VirtualGeometryRenderer>() == null && !r.enabled)
+                        {
+                            Undo.RecordObject(r, "Enable LOD renderer");
+                            r.enabled = true;
+                        }
+            }
+            Undo.CollapseUndoOperations(undoGroup);
+            return list.Count;
         }
 
         public static int Revert(IEnumerable<GameObject> roots)
@@ -128,6 +312,7 @@ namespace UNanite.Editor
             }
             foreach (var g in roots.SelectMany(r => r.GetComponentsInChildren<LODGroup>(true)).Distinct())
             {
+                RemoveLodGroup(g);
                 Undo.RecordObject(g, "Enable LODGroup");
                 g.enabled = true;
                 foreach (var lod in g.GetLODs())

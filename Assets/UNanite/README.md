@@ -81,7 +81,15 @@ Metal the raster also writes hardware barycentrics, so the resolve shades each f
 re-evaluating the vertex graph, and the motion vectors of the moved vertices (TAA, motion blur of
 swaying leaves).
 
-Experimental, off by default (M12, M13; `VirtualGeometrySettings`) - validated by render tests, but
+Scene foliage (M14): converting a LODGroup whose LOD0 is alpha-tested keeps every LOD: foliage is built
+without simplification (the cluster DAG would drop whole leaves), and **Virtual Geometry LOD Group** draws the
+group's own LODs as discrete virtual geometry LODs, switched where Unity's LODGroup switches (at 1080 lines).
+
+Sample (M14, Package Manager > UNanite > Samples > **Quarry Scene**, HDRP): *Tools > UNanite > Samples >
+Quarry Scene* imports a folder of Megascans downloads and builds a dense scanned quarry from them (or from
+procedural rocks), converted to virtual geometry; in Play Mode V switches to Unity's renderers for comparisons.
+
+Experimental, off by default (M12, M13, M13b; `VirtualGeometrySettings`) - validated by render tests, but
 measured no faster than the default path in the test scenes (see `Documentation~/Milestones.md`):
 * `terrainVirtualTexture`: VG terrains shade from a runtime virtual texture - their blended layers
   are baked into cached 128 × 128 tiles on demand (GPU feedback from the visibility buffer) instead
@@ -89,6 +97,9 @@ measured no faster than the default path in the test scenes (see `Documentation~
 * `virtualShadowMaps`: VG shadow casters of every-frame lights are cached in 128 × 128 pages; only
   pages whose casters moved, appeared or were never rendered are rasterised again, the rest is copied
   into HDRP's shadow atlas (directional cascades scroll their pages with the camera).
+* `sunShadowClipmap` (M13b prototype): the sun's shadow from UNanite's own clipmap of cached pages
+  (texel about one pixel near the camera), read by HDRP through an optional patch (`HdrpPatch~/README.md`);
+  VG casters with plain materials only for now - foliage and MeshRenderers stay in HDRP's cascades.
 
 ## Native builder
 

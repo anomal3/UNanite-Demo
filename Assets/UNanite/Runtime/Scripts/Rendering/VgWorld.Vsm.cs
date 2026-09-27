@@ -108,6 +108,8 @@ namespace UNanite
             public static readonly int Draw = Shader.PropertyToID("_VgVsmDraw");
             public static readonly int Entry = Shader.PropertyToID("_VgVsmEntry");
             public static readonly int ZClip = Shader.PropertyToID("_VgZClip");
+            public static readonly int CopySrc = Shader.PropertyToID("VG_VsmCopySrc");
+            public static readonly int CopyDst = Shader.PropertyToID("VG_VsmCopyDst");
         }
 
         void InitVsm()
@@ -115,7 +117,7 @@ namespace UNanite
             var cs = Resources.Load<ComputeShader>("UNanite/VgVsm");
             var raster = Shader.Find("Hidden/UNanite/VsmRaster");
             var composite = Shader.Find("Hidden/UNanite/VsmComposite");
-            if (!HasKernels(cs, "Begin", "Release", "Invalidate", "Mark", "Finalize", "ClearPages", "DirtyPyramid") ||
+            if (!HasKernels(cs, "Begin", "Release", "Invalidate", "Mark", "Finalize", "ClearPages", "DirtyPyramid", "CopySlots") ||
                 raster == null || !raster.isSupported || composite == null || !composite.isSupported || !SystemInfo.supportsComputeShaders)
                 return;
             m_VsmCs = cs;
@@ -126,6 +128,7 @@ namespace UNanite
             k_VsmFinalize = cs.FindKernel("Finalize");
             k_VsmClear = cs.FindKernel("ClearPages");
             k_VsmDirty = cs.FindKernel("DirtyPyramid");
+            InitSunClipmap(cs); // M13b
             for (int i = 0; i < 4; ++i)
             {
                 int list = i & 1;
@@ -162,7 +165,7 @@ namespace UNanite
                 return false;
             }
             m_VsmEntries = new GraphicsBuffer(GraphicsBuffer.Target.Structured, k_VsmMaxEntries, k_VsmEntryFloats * 4);
-            m_VsmTables = new VgRangeAllocator(1 << 14);
+            m_VsmTables = new VgRangeAllocator(1 << 16); // 1 MB of slots: the M13b clipmap alone takes 12 x 65^2
             m_VsmPages = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_VsmTables.Capacity, 16);
             m_VsmList = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_VsmTables.Capacity, 4);
             m_VsmFree = new GraphicsBuffer(GraphicsBuffer.Target.Structured, m_VsmPoolPages + 1, 4);
@@ -215,6 +218,7 @@ namespace UNanite
 
         void DisposeVsm()
         {
+            VgSunGlobals.BindDummies(); // M13b: never leave released buffers bound for the patched HDRP
             ReleaseRetiredVsm();
             foreach (var b in new[] { m_VsmEntries, m_VsmPages, m_VsmFree, m_VsmCounters, m_VsmDirty, m_VsmList, m_VsmArgs, m_VsmSpheres, m_VsmHzb, m_VsmBatch })
                 b?.Dispose();
@@ -366,6 +370,7 @@ namespace UNanite
             Shader.SetGlobalBuffer(VsmIds.Pages, m_VsmPages);
             Shader.SetGlobalBuffer(VsmIds.List, m_VsmList);
             Shader.SetGlobalTexture(VsmIds.Pool, m_VsmPool);
+            VgSunGlobals.Bind(m_VsmEntries, m_VsmPages, m_VsmPool); // M13b: the HDRP patch binds them in every lighting draw
         }
 
         /// <summary>M13: drops every cached shadow page (after edits the invalidation does not see, e.g. material changes).</summary>
@@ -931,7 +936,12 @@ namespace UNanite
             var pages = new GraphicsBuffer(GraphicsBuffer.Target.Structured, capacity, 16);
             var list = new GraphicsBuffer(GraphicsBuffer.Target.Structured, capacity, 4);
             pages.SetData(EmptyVsmSlots(capacity));
-            cmd.CopyBuffer(m_VsmPages, pages);
+            // CommandBuffer.CopyBuffer needs equal sizes: copy the old slots with a kernel
+            int k = m_VsmCs.FindKernel("CopySlots");
+            cmd.SetComputeIntParams(m_VsmCs, VsmIds.Params, m_VsmPages.count, 0, 0, 0);
+            cmd.SetComputeBufferParam(m_VsmCs, k, VsmIds.CopySrc, m_VsmPages);
+            cmd.SetComputeBufferParam(m_VsmCs, k, VsmIds.CopyDst, pages);
+            cmd.DispatchCompute(m_VsmCs, k, (m_VsmPages.count + 63) / 64, 1, 1);
             // the command buffer still reads the old ones: released at the next frame start
             m_VsmRetired.Add(m_VsmPages);
             m_VsmRetired.Add(m_VsmList);
@@ -940,6 +950,7 @@ namespace UNanite
             m_VsmTables.Grow(capacity);
             Shader.SetGlobalBuffer(VsmIds.Pages, m_VsmPages);
             Shader.SetGlobalBuffer(VsmIds.List, m_VsmList);
+            VgSunGlobals.Bind(m_VsmEntries, m_VsmPages, m_VsmPool); // the old pages buffer is released next frame
         }
 
         void EnsureVsmDummy(int res)

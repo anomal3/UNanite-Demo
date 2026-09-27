@@ -54,6 +54,27 @@ Shader "Hidden/UNanite/ShadowRaster"
             StructuredBuffer<uint4> VG_ShadowRecords;
             StructuredBuffer<uint4> VG_ShadowViews; // per view slot: (first record, list 0 size, list 1 size, 0)
             ByteAddressBuffer VG_PagePool;
+            StructuredBuffer<VgGroup> VG_Groups;
+            StructuredBuffer<VgLodSwitch> VG_LodSwitches;
+
+            // How far the drawn cluster may lie from the full-detail surface: the error of the group it
+            // was simplified from, and for an HLOD node (terrain tiles) its switch error (the node's own
+            // source is a cut of its children). The camera draws finer clusters of the same surface, so a
+            // caster left in place shadows it wherever the coarse surface runs above it (concave slopes
+            // at low sun: whole hillsides in shadow); pushed that far away from the light it never does.
+            float CasterError(VgInstanceGpu inst, VgMeshGpu mesh, uint pageAddress, uint clusterInPage)
+            {
+                uint refined = VG_PagePool.Load(pageAddress + VG_PAGE_HEADER_SIZE + clusterInPage * VG_CLUSTER_HEADER_SIZE + 60);
+                float e = 0.0;
+                if (refined != VG_INVALID)
+                {
+                    float g = VG_Groups[mesh.groupBase + refined].error;
+                    e = g < VG_FLT_MAX ? g * inst.maxScale : 0.0;
+                }
+                if (inst.lodSelf != VG_INVALID)
+                    e = max(e, VG_LodSwitches[inst.lodSelf].error);
+                return e;
+            }
 
             struct Attributes
             {
@@ -95,7 +116,18 @@ Shader "Hidden/UNanite/ShadowRaster"
                     t = t.xzy; // negative determinant flips the winding
                 uint v = t[corner % 3u];
                 float3 positionWS = VgTransformPoint(inst, VgDecodePosition(VG_PagePool, c, v, mesh));
-                o.positionCS = TransformWorldToHClip(GetCameraRelativePositionWS(positionWS));
+                float3 positionVS = TransformWorldToView(GetCameraRelativePositionWS(positionWS));
+                float error = CasterError(inst, mesh, vis.y, vis.z);
+                if (error > 0.0)
+                {
+                    // away from the light: along the view axis (directional) or the ray from the light (spot,
+                    // point); the split's own projection tells (unity_OrthoParams belongs to the camera)
+                    if (UNITY_MATRIX_P[3][3] < 0.5)
+                        positionVS *= 1.0 + error / max(length(positionVS), 1e-4);
+                    else
+                        positionVS.z -= error;
+                }
+                o.positionCS = TransformWViewToHClip(positionVS);
                 return o;
             }
 

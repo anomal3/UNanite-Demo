@@ -14,6 +14,17 @@ namespace UNanite
         Materials = 6,
     }
 
+    /// <summary>M13b: how HDRP's sun shadow uses UNanite's clipmap (needs the optional HDRP patch).</summary>
+    public enum VgSunClipmapMode
+    {
+        /// <summary>No clipmap: HDRP's cascades only.</summary>
+        Off = 0,
+        /// <summary>The sun's shadow comes from the clipmap (VG casters); HDRP's cascades only where no page is resident.</summary>
+        Clipmap = 1,
+        /// <summary>The darker of the clipmap and HDRP's cascades (MeshRenderer casters stay in the cascades).</summary>
+        MinWithHdrp = 2,
+    }
+
     /// <summary>Which camera-visible region keeps shadow casters alive in receiver culling (M6).</summary>
     public enum VgShadowReceiverCulling
     {
@@ -85,6 +96,27 @@ namespace UNanite
         [Range(256, 8192)] public int vsmPoolPages = 2048;
         [Tooltip("Frames a cached page may go unused before its physical page is reused.")]
         [Range(8, 1200)] public int vsmPageMaxAge = 240;
+
+        [Header("Sun shadow clipmap (M13b, prototype; needs the optional HDRP patch)")]
+        [Tooltip("The sun's shadow from UNanite's own clipmap of cached 128 x 128 pages (levels of doubling size around the camera, texel about one pixel), sampled by HDRP's lighting through the optional HDRP patch (HdrpPatch~). Clipmap: VG casters only; MinWithHdrp: also HDRP's own cascades (MeshRenderers). Without the patch the clipmap is built but not used.")]
+        public VgSunClipmapMode sunShadowClipmap = VgSunClipmapMode.Off;
+        [Range(1, 16)] public int sunClipmapLevels = 12;
+        [Tooltip("Texels per level side (multiple of 128; the page-raster target is this size, R8).")]
+        [Range(1024, 8192)] public int sunClipmapResolution = 8192;
+        [Tooltip("Texel size of the finest level in metres (level k: x 2^k).")]
+        [Range(0.0005f, 0.1f)] public float sunClipmapTexel0 = 0.004f;
+        [Tooltip("Texels per pixel footprint: 1 = a texel about the size of a pixel, 2 = texels twice as large (4x fewer pages).")]
+        [Range(0.25f, 8f)] public float sunClipmapLodBias = 1f;
+        [Tooltip("Pages rendered per frame at most (the rest follow in later frames; lookups use coarser levels meanwhile).")]
+        [Range(16, 4096)] public int sunClipmapPageBudget = 512;
+        [Tooltip("Slope-scaled depth bias of the page raster (like HDRP's slope bias).")]
+        [Range(0f, 8f)] public float sunClipmapSlopeBias = 2f;
+        [Tooltip("Constant depth bias of the lookup, in texels of the level.")]
+        [Range(0f, 8f)] public float sunClipmapDepthBias = 1f;
+        [Tooltip("Normal offset of the lookup, in texels of the level.")]
+        [Range(0f, 8f)] public float sunClipmapNormalOffset = 1f;
+        [Tooltip("Tent filter radius of the lookup in texels (4 x 4 taps: up to 1.5).")]
+        [Range(0.5f, 1.5f)] public float sunClipmapFilterRadius = 1.5f;
 
         [Header("Terrain virtual texture (M12)")]
         [Tooltip("VG terrains shade from a runtime virtual texture: their blended layers (albedo, normal, smoothness, metallic, AO) are baked into cached tiles on demand and the resolve samples those instead of blending up to 8 layers per pixel every frame. Close-up detail finer than the texture keeps the direct blend.")]

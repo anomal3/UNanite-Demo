@@ -1,7 +1,7 @@
 {
   "name": "com.unanite.virtualgeometry",
   "displayName": "UNanite Virtual Geometry",
-  "version": "0.13.0-preview",
+  "version": "0.13.2-preview",
   "unity": "6000.2",
   "description": "Virtualized geometry for Unity 6 (Nanite-style cluster DAG, GPU-driven culling, visibility buffer, page streaming). Primary target HDRP 17, secondary URP 17. D3D12 first, Vulkan second.",
   "keywords": [
@@ -17,6 +17,13 @@
     "com.unity.collections": "2.5.1",
     "com.unity.burst": "1.8.19"
   },
+  "samples": [
+    {
+      "displayName": "Quarry Scene",
+      "description": "HDRP. Builds a dense scanned quarry from your Megascans downloads (Tools > UNanite > Samples > Quarry Scene imports them) or from procedural rocks, as virtual geometry; flythrough, stats overlay, V switches to Unity's renderers (Mesh LOD, LODGroups, terrain) for comparisons.",
+      "path": "Samples~/QuarryScene"
+    }
+  ],
   "author": {
     "name": "Roman Koscheev (anomal3)",
     "url": "https://github.com/anomal3/UNanite-Demo"

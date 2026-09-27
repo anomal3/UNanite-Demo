@@ -13,6 +13,12 @@
 //   DirtyPyramid    level 0 of an entry's "dirty pyramid" in the receiver layout (VgWorld.Shadows.cs):
 //                   +3e38 over dirty pages, -3e38 elsewhere; the batched shadow culling then keeps only
 //                   casters over dirty pages (VgCull.compute receiver test)
+//
+// M13b sun shadow clipmap (VgWorld.SunClipmap.cs, VgSunClipmap.hlsl):
+//   ClipmapRequest  per camera pixel: its clipmap level (pixel footprint, window) and the pages within
+//                   the filter / normal-offset reach of its texel get VSM_REQUEST in their slot
+//   MarkRequested   Mark with "needed = requested" for one level (dispatched coarse to fine, so a full
+//                   page budget leaves fine levels for later frames: lookups fall back to coarser ones)
 
 #pragma kernel Begin
 #pragma kernel Release
@@ -21,8 +27,14 @@
 #pragma kernel Finalize
 #pragma kernel ClearPages
 #pragma kernel DirtyPyramid
+#pragma kernel ClipmapRequest
+#pragma kernel MarkRequested
+#pragma kernel CopySlots
 
 #include "../../ShaderLibrary/VgVsm.hlsl"
+#include "../../ShaderLibrary/VgSunClipmap.hlsl"
+
+#define VSM_REQUEST (1u << 18)
 
 StructuredBuffer<VgVsmEntry> VG_VsmEntries;
 RWStructuredBuffer<uint4> VG_VsmPages;
@@ -313,4 +325,130 @@ void DirtyPyramid(uint3 id : SV_DispatchThreadID)
         dirty = dirty || DirtyAt(e, CullToLocal(e, ndc));
     }
     VG_VsmHzbOut[batch.y * _VsmPyramid.x + id.y * size + id.x] = dirty ? 3e38 : -3e38;
+}
+
+// ---- M13b sun clipmap ----------------------------------------------------------------------------
+
+Texture2DArray<float> _VgDepth;  // HDRP camera depth (XR slices)
+float4x4 _ClipInvViewProj;   // camera clip (device depth) -> absolute world
+int4 _ClipScreen;            // xy: pixels, z: 1 = reversed Z, w: page budget (dirty pages per frame)
+float4 _ClipReach;           // x: texels around a pixel's texel whose pages it needs
+
+void RequestPage(VgVsmEntry e, int2 texel)
+{
+    int2 page = int2(VsmPageOf(texel.x), VsmPageOf(texel.y));
+    uint idx = e.table.x + VsmSlot(e, page);
+    if ((VG_VsmPages[idx].x & VSM_REQUEST) == 0)
+        InterlockedOr(VG_VsmPages[idx].x, VSM_REQUEST);
+}
+
+[numthreads(8, 8, 1)]
+void ClipmapRequest(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _ClipScreen.xy))
+        return;
+    float z = _VgDepth.Load(int4(id.xy, 0, 0));
+    if (_ClipScreen.z != 0 ? z <= 0.0 : z >= 1.0)
+        return; // sky
+    float2 ndc = float2((id.x + 0.5) / _ClipScreen.x * 2.0 - 1.0, 1.0 - (id.y + 0.5) / _ClipScreen.y * 2.0);
+    float4 w = mul(_ClipInvViewProj, float4(ndc, z, 1.0));
+    float3 p = w.xyz / w.w;
+    int levels = (int)_UNaniteSunParams.y;
+    int first = (int)_UNaniteSunParams.z;
+    float reach = _ClipReach.x;
+    for (int level = VgSunLevelFor(p); level < levels; ++level)
+    {
+        VgVsmEntry e = VG_VsmEntries[first + level];
+        VgSunEntry se = _UNaniteSunEntries[first + level];
+        float2 g = VgSunGlobalTexel(se, p);
+        if (!VgSunInside(se, g, _UNaniteSunBias.y + 2.0))
+            continue;
+        // the lookup falls back to coarser levels while a page is missing: request this level and the
+        // next coarser one (cheap: 4x fewer texels), so a fallback always exists after the first frames
+        int2 lo = (int2)floor(g - reach), hi = (int2)floor(g + reach);
+        RequestPage(e, lo);
+        RequestPage(e, int2(hi.x, lo.y));
+        RequestPage(e, int2(lo.x, hi.y));
+        RequestPage(e, hi);
+        if (level + 1 < levels)
+        {
+            VgVsmEntry c = VG_VsmEntries[first + level + 1];
+            float2 gc = VgSunGlobalTexel(_UNaniteSunEntries[first + level + 1], p);
+            RequestPage(c, (int2)floor(gc - reach));
+            RequestPage(c, (int2)floor(gc + reach));
+            RequestPage(c, int2((int)floor(gc.x - reach), (int)floor(gc.y + reach)));
+            RequestPage(c, int2((int)floor(gc.x + reach), (int)floor(gc.y - reach)));
+        }
+        return;
+    }
+}
+
+// Mark of one clipmap level (VG_VsmBatch[0]): needed = requested this frame; new / stale pages are
+// dirtied while the frame's page budget lasts.
+[numthreads(8, 8, 1)]
+void MarkRequested(uint3 id : SV_DispatchThreadID)
+{
+    uint4 batch = VG_VsmBatch[id.z];
+    uint entry = batch.x;
+    VgVsmEntry e = VG_VsmEntries[entry];
+    int res = e.window.z;
+    int2 first = VsmFirstPage(e);
+    int2 last = int2(VsmPageOf(e.window.x + res - 1), VsmPageOf(e.window.y + res - 1));
+    int2 page = first + int2(id.xy);
+    if (any(page > last))
+        return;
+    uint idx = e.table.x + VsmSlot(e, page);
+    uint4 p = VG_VsmPages[idx];
+    bool needed = (p.x & VSM_REQUEST) != 0;
+    p.x &= ~VSM_REQUEST;
+    uint key = VsmKey(page);
+    if (p.y != key)
+        p = uint4(VSM_NONE, key, 0, 0);
+    uint phys = p.x & 0xFFFFu;
+    bool valid = phys != VSM_NONE && (p.x & VSM_VALID) != 0 && p.w == e.table.z;
+    if (needed && !valid && VG_VsmCounters[0] >= (uint)_ClipScreen.w)
+        needed = false; // over budget: a later frame renders it (lookups use a coarser level meanwhile)
+    if (needed && phys == VSM_NONE)
+    {
+        uint n;
+        InterlockedAdd(VG_VsmFree[0], 0xFFFFFFFFu, n); // pop
+        if ((int)n > 0)
+            phys = VG_VsmFree[n];
+        else
+        {
+            InterlockedAdd(VG_VsmFree[0], 1u); // undo
+            InterlockedAdd(VG_VsmCounters[1], 1u);
+            needed = false;
+        }
+        p.x = phys; // no flags: new content
+    }
+    if (needed)
+    {
+        p.x = phys | VSM_VALID | (valid ? 0u : VSM_DIRTY);
+        p.z = _VsmParams.y;
+        p.w = e.table.z;
+        if (!valid)
+        {
+            uint d;
+            InterlockedAdd(VG_VsmCounters[0], 1u, d);
+            if (d < _VsmParams.w)
+                VG_VsmDirty[d] = phys;
+        }
+        InterlockedAdd(VG_VsmCounters[2], 1u);
+    }
+    else
+        p.x &= ~(VSM_DIRTY | (valid ? 0u : VSM_VALID));
+    VG_VsmPages[idx] = p;
+}
+
+// Page table growth (VgWorld.GrowVsmTables): the live slots into the larger buffer (CommandBuffer.CopyBuffer
+// needs equal sizes).
+StructuredBuffer<uint4> VG_VsmCopySrc;
+RWStructuredBuffer<uint4> VG_VsmCopyDst;
+
+[numthreads(64, 1, 1)]
+void CopySlots(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _VsmParams.x)
+        VG_VsmCopyDst[id.x] = VG_VsmCopySrc[id.x];
 }
