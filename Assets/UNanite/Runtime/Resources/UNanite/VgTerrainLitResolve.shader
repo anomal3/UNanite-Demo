@@ -15,6 +15,7 @@ Shader "Hidden/UNanite/TerrainLitResolve"
         [HideInInspector][NoScaleOffset] _VgTerrainHeightmap("Heightmap", 2D) = "black" {}
         [HideInInspector] _VgTerrainParams("Heightmap params", Vector) = (1, 1, 1, 1)
         [HideInInspector] _VgTerrainSpacing("Sample spacing", Vector) = (1, 1, 1, 1)
+        [HideInInspector] _VgRvtParams("Virtual texture", Vector) = (0, 0, 0, 0)
         [HideInInspector] _Splat0("Layer 0 Albedo", 2D) = "grey" {}
         [HideInInspector][NoScaleOffset] _Normal0("Layer 0 Normal", 2D) = "bump" {}
         [HideInInspector][NoScaleOffset] _Mask0("Layer 0 Mask", 2D) = "grey" {}
@@ -143,6 +144,7 @@ Shader "Hidden/UNanite/TerrainLitResolve"
         float4 _Control1_ST;
         float4 _VgTerrainParams;  // x: heightmap resolution, y: 1 / resolution, z: world height of a texel value of 1 (2 * size.y), w: unused
         float4 _VgTerrainSpacing; // x, z: world spacing of heightmap samples
+        float4 _VgRvtParams;      // M12 virtual texture (VgRvt.hlsl): page-table base, log2 size, top mip, on
     CBUFFER_END
     #ifdef DEBUG_DISPLAY
     UNITY_TERRAIN_CB_DEBUG_VARS // TerrainLitDebug (texture streaming debug), outside UnityPerMaterial: its layout stays the same
@@ -152,6 +154,8 @@ Shader "Hidden/UNanite/TerrainLitResolve"
 
     SubShader
     {
+        // HDRP only: URP projects skip it instead of failing on the HDRP includes
+        PackageRequirements { "com.unity.render-pipelines.high-definition" }
         Tags { "RenderPipeline" = "HDRenderPipeline" "RenderType" = "Opaque" }
 
         Pass
@@ -184,6 +188,7 @@ Shader "Hidden/UNanite/TerrainLitResolve"
             #pragma multi_compile_fragment DECALS_OFF DECALS_3RT DECALS_4RT
             #pragma multi_compile_fragment _ DECAL_SURFACE_GRADIENT
             #pragma multi_compile_fragment _ RENDERING_LAYERS
+            #pragma shader_feature_local_fragment _ VG_TERRAIN_RVT // M12: surface from the runtime virtual texture
 
             #define SHADERPASS SHADERPASS_GBUFFER
             #ifdef DEBUG_DISPLAY
@@ -233,6 +238,74 @@ Shader "Hidden/UNanite/TerrainLitResolve"
 
             #pragma vertex VgResolveVert
             #pragma fragment VgMotionFrag
+
+            ENDHLSL
+        }
+
+        // M12: bakes one tile of the terrain's runtime virtual texture (VgWorld.Rvt.cs), drawn with this
+        // terrain's own resolve material: TerrainLit's splat blend at the tile's texel footprint (the
+        // implicit derivatives pick the layer mips) and the heightmap normal combined with the layers'
+        // normals -> atlas MRT: (albedo, AO), (world normal x / z, smoothness, metallic).
+        Pass
+        {
+            Name "VgRvtBake"
+            Tags { "LightMode" = "VgRvtBake" }
+
+            ZTest Always
+            ZWrite Off
+            Cull Off
+
+            HLSLPROGRAM
+
+            #pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch switch2
+            #pragma vertex BakeVert
+            #pragma fragment BakeFrag
+
+            #define SURFACE_GRADIENT
+            #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/NormalSurfaceGradient.hlsl"
+            #include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/TerrainLit/TerrainLitSurfaceData.hlsl"
+            #include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/TerrainLit/TerrainLit_Splatmap.hlsl"
+            #include "../../ShaderLibrary/VgTerrainNormal.hlsl"
+            #define VG_RVT_NO_SAMPLING
+            #include "../../ShaderLibrary/VgRvt.hlsl"
+
+            float4 _VgRvtBakeTile; // xy: atlas pixel of the tile's first texel (border included), z: 1 / atlas size
+            float4 _VgRvtBakeUV;   // xy: terrain UV of that texel's corner, z: terrain UV per texel
+
+            struct BakeVaryings
+            {
+                float4 positionCS : SV_POSITION;
+                float2 uv : TEXCOORD0;
+            };
+
+            BakeVaryings BakeVert(uint id : SV_VertexID)
+            {
+                // two triangles: (0,0) (1,0) (0,1) | (0,1) (1,0) (1,1)
+                float2 k = float2(id == 1 || id == 4 || id == 5 ? 1 : 0, id == 2 || id == 3 || id == 5 ? 1 : 0);
+                float2 pixel = _VgRvtBakeTile.xy + k * VG_RVT_STRIDE;
+                float2 ndc = pixel * _VgRvtBakeTile.z * 2.0 - 1.0;
+            #if UNITY_UV_STARTS_AT_TOP
+                ndc.y = -ndc.y; // row 0 at the top of the render target
+            #endif
+                BakeVaryings o;
+                o.positionCS = float4(ndc, 0.5, 1.0);
+                o.uv = _VgRvtBakeUV.xy + k * VG_RVT_STRIDE * _VgRvtBakeUV.z; // texel centres at the pixel centres
+                return o;
+            }
+
+            void BakeFrag(BakeVaryings i, out float4 outAlbedo : SV_Target0, out float4 outNormal : SV_Target1)
+            {
+                TerrainLitSurfaceData t;
+                InitializeTerrainLitSurfaceData(t);
+                TerrainLitShade(i.uv, t);
+                float3 n = VgTerrainNormal(i.uv);
+            #ifdef _NORMALMAP
+                float3x3 frame = BuildTangentToWorld(VgTerrainTangent(n), n);
+                n = SurfaceGradientResolveNormal(n, SurfaceGradientFromTBN(t.normalData.xy, frame[0], frame[1]));
+            #endif
+                outAlbedo = float4(t.albedo, t.ao);
+                outNormal = float4(n.xz * 0.5 + 0.5, t.smoothness, t.metallic);
+            }
 
             ENDHLSL
         }

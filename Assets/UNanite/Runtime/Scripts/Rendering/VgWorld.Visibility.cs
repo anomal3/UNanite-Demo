@@ -444,7 +444,7 @@ namespace UNanite
             string reason = null;
             if (!m_Settings.visibilityBuffer)
                 reason = "disabled in settings";
-            else if (m_Settings.debugView != VgDebugView.None)
+            else if (DebugView != VgDebugView.None)
                 reason = "debug view active";
             else if (!m_AnyResolveBin)
                 reason = "no resolve-capable material";
@@ -608,6 +608,8 @@ namespace UNanite
             cmd.DispatchCompute(m_Classify, k_AllocateTiles, 1, 1, 1);
             cmd.DispatchCompute(m_Classify, k_WriteTiles, tilesX, tilesY, 1);
             cmd.EndSample(ClassifySampler);
+
+            RenderRvt(ctx, width, height); // M12: tile bakes + feedback of VG terrains' virtual textures
 
             // consumed by the resolve draws in HDRP's GBuffer pass of this camera
             cmd.SetGlobalTexture(VisIds.VisBuffer, m_VisBuffer);

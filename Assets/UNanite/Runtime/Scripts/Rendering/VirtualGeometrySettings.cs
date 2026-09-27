@@ -78,6 +78,24 @@ namespace UNanite
         [Tooltip("Resolve tile list capacity as a multiple of the screen's 8x8 tile count (tiles containing several materials use several entries).")]
         [Range(1, 16)] public int resolveTileListFactor = 4;
 
+        [Header("Virtual shadow maps (M13)")]
+        [Tooltip("Shadow maps of VG casters are cached in 128 x 128 pages: only pages whose casters moved, appeared or were never rendered are rasterised again, the rest is copied into HDRP's shadow atlas. Applies to every-frame lights whose splits use receiver culling and the shadow raster; alpha-tested / animated VG materials, skinned meshes and MeshRenderers still render every frame.")]
+        public bool virtualShadowMaps = false; // M13: off until validated in the editor (see Milestones.md)
+        [Tooltip("Physical pages of the virtual-shadow-map pool (64 KB each; 2048 = 128 MB).")]
+        [Range(256, 8192)] public int vsmPoolPages = 2048;
+        [Tooltip("Frames a cached page may go unused before its physical page is reused.")]
+        [Range(8, 1200)] public int vsmPageMaxAge = 240;
+
+        [Header("Terrain virtual texture (M12)")]
+        [Tooltip("VG terrains shade from a runtime virtual texture: their blended layers (albedo, normal, smoothness, metallic, AO) are baked into cached tiles on demand and the resolve samples those instead of blending up to 8 layers per pixel every frame. Close-up detail finer than the texture keeps the direct blend.")]
+        public bool terrainVirtualTexture = false; // M12: off until validated in the editor (see Milestones.md)
+        [Tooltip("Texel density of the finest mip (texels per metre, rounded up to a power-of-two virtual size per terrain, at most 131072 texels).")]
+        [Range(8f, 256f)] public float rvtTexelsPerMeter = 64f;
+        [Tooltip("Atlas tiles per side (136 x 136 texels each, 2 x RGBA8): 24 = 576 tiles, 85 MB.")]
+        [Range(8, 60)] public int rvtAtlasTiles = 24;
+        [Tooltip("Tiles baked per frame at most (the top mips of every terrain are baked at once when it is registered).")]
+        [Range(1, 128)] public int rvtBakesPerFrame = 16;
+
         [Header("Occlusion culling (M4)")]
         [Tooltip("Two-phase HZB occlusion culling for visibility-buffer cameras: previous-frame HZB first, deferred work re-tested against the current frame's depth.")]
         public bool occlusionCulling = true;

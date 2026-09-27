@@ -79,6 +79,8 @@ Shader "Hidden/UNanite/VisBufferRaster"
 
     SubShader
     {
+        // HDRP only: URP projects skip it instead of failing on the HDRP includes
+        PackageRequirements { "com.unity.render-pipelines.high-definition" }
         Tags { "RenderPipeline" = "HDRenderPipeline" }
 
         Pass

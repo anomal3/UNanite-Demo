@@ -129,6 +129,8 @@ uint DebugId(uint mode, uint4 vis, VgCluster c, VgMeshGpu mesh)
 
 #define VIEW_FLAG_SHADOW 1u
 #define VIEW_FLAG_NO_CONE 2u
+#define VIEW_FLAG_ONLY_RASTER 4u   // M13: cached shadow pages: records of shadow-raster bins only
+#define VIEW_FLAG_SKIP_RASTER 8u   // M13: per-frame culling of a cached split: every other bin
 
 #define VG_INSTANCE_OCCLUDABLE 8u
 
@@ -373,7 +375,7 @@ bool IsOccluded(float3 center, float radius)
         pMin = max(pMin, 0.0);
         pMax = min(pMax, screen - 1.0);
         if (pMin.x > pMax.x || pMin.y > pMax.y)
-            return false; // outside: the frustum test owns it
+            return true; // outside the shadow map: renders nothing into it (the split planes may be far wider, e.g. HDRP's "Extend Shadow Culling")
     }
     uint2 a = (uint2)pMin;
     uint2 b = (uint2)pMax;
@@ -438,6 +440,11 @@ bool ProgrammableInVisView(uint binFlags)
 void AppendVisible(uint4 record, uint binFlags, uint triangleCount, bool software)
 {
     bool resolve = (binFlags & _ViewConfig.y) != 0 && !ProgrammableInVisView(binFlags);
+    uint viewFlags = (uint)ViewLodParams().z;
+    if ((viewFlags & VIEW_FLAG_ONLY_RASTER) != 0 && !resolve)
+        return;
+    if ((viewFlags & VIEW_FLAG_SKIP_RASTER) != 0 && resolve)
+        return;
 
     uint at;
     InterlockedAdd(VG_Counters[Ctr(C_VISIBLE)], 1, at);

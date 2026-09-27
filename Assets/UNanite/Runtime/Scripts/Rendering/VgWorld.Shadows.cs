@@ -47,8 +47,31 @@ namespace UNanite
         bool m_ShadowRasterSupported;
         readonly bool[] m_AnyShadowBin = new bool[2]; // per cull mode (single / double-sided), this frame
 
-        Camera m_CullOwner; // camera whose Cull() is running: its lights' splits follow it
-        Vector4 m_CullOwnerLod; // its position and perspective LOD term (shadowCameraLod)
+        // Camera whose shadow splits are being culled, and its position + perspective LOD term
+        // (shadowCameraLod). Set by the camera view of the BRG callback; a light's splits re-resolve
+        // it (ResolveShadowOwner): HDRP 17 culls every camera of the frame first (a planar reflection
+        // probe after the main camera) and their lights after that, so "the last culled camera" is not
+        // the owner of a split. With it the caster frustum of the main camera's cascades was built from
+        // the probe's camera (near cascade empty) and receiver culling deferred them to that camera's pass.
+        Camera m_CullOwner
+        {
+            get => m_CullOwnerCamera;
+            set => m_CullOwnerCamera = value;
+        }
+        Vector4 m_CullOwnerLod
+        {
+            get => m_CullOwnerLodValue;
+            set
+            {
+                m_CullOwnerLodValue = value;
+                if (m_CullOwnerCamera != null)
+                    RememberCulledCamera(m_CullOwnerCamera, value);
+            }
+        }
+        Camera m_CullOwnerCamera;
+        Vector4 m_CullOwnerLodValue;
+        // cameras culled this frame with their LOD vector (position, perspective term)
+        readonly List<(Camera camera, Vector4 lod)> m_CulledCameras = new List<(Camera, Vector4)>();
         readonly Dictionary<Camera, List<(SubView view, int slot)>> m_PendingShadows = new Dictionary<Camera, List<(SubView, int)>>();
         // camera ran the AfterOpaqueDepthAndNormal pass on its last rendered frame (and it culled
         // every split deferred to it); cameras not in here cull their shadow splits immediately
@@ -172,6 +195,7 @@ namespace UNanite
         void BeginShadowFrame()
         {
             m_CullOwner = null;
+            m_CulledCameras.Clear();
             // splits deferred to a camera whose pass never ran: that camera culls immediately from now on
             foreach (var pair in m_PendingShadows)
                 if (pair.Value.Count > 0)
@@ -208,9 +232,52 @@ namespace UNanite
             }
         }
 
-        // Culling-time configuration of a shadow split (after the generic sub-view setup).
-        void ConfigureShadowView(ref SubView sv, in BatchCullingContext ctx, in CullingSplit split)
+        void RememberCulledCamera(Camera camera, Vector4 lod)
         {
+            for (int i = 0; i < m_CulledCameras.Count; ++i)
+                if (m_CulledCameras[i].camera == camera)
+                {
+                    m_CulledCameras[i] = (camera, lod);
+                    return;
+                }
+            m_CulledCameras.Add((camera, lod));
+        }
+
+        // The camera a light's splits belong to: Unity culls shadow casters with the owning camera's
+        // LOD parameters, so its position (and field of view, for cameras at one spot such as a scope
+        // camera under the main one) picks it among this frame's culled cameras.
+        void ResolveShadowOwner(in BatchCullingContext ctx)
+        {
+            var lod = ctx.lodParameters;
+            Camera best = null;
+            Vector4 bestLod = Vector4.zero;
+            float bestScore = float.MaxValue;
+            foreach (var (camera, camLod) in m_CulledCameras)
+            {
+                if (camera == null)
+                    continue;
+                float score = (camera.transform.position - lod.cameraPosition).sqrMagnitude;
+                if (!lod.isOrthographic && !camera.orthographic)
+                    score += Mathf.Abs(camera.fieldOfView - lod.fieldOfView) * 0.01f;
+                else if (lod.isOrthographic != camera.orthographic)
+                    score += 1e6f;
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    best = camera;
+                    bestLod = camLod;
+                }
+            }
+            if (best == null)
+                return; // no camera view this frame (e.g. culling-layer early-out): keep the last one
+            m_CullOwnerCamera = best;
+            m_CullOwnerLodValue = bestLod;
+        }
+
+        // Culling-time configuration of a shadow split (after the generic sub-view setup).
+        void ConfigureShadowView(ref SubView sv, in BatchCullingContext ctx, in CullingSplit split, int splitIndex)
+        {
+            ResolveShadowOwner(ctx);
             sv.shadowRaster = m_Settings.shadowRaster && m_ShadowRasterSupported;
             sv.lightViewProj = split.cullingMatrix;
             sv.splitSphere = new Vector4(split.sphereCenter.x, split.sphereCenter.y, split.sphereCenter.z, split.sphereRadius);
@@ -218,11 +285,13 @@ namespace UNanite
             // casters are never finer than the camera needs them (low sun: the near cascades' caster
             // volumes reach kilometres of terrain at the finest texel LOD otherwise)
             sv.camLod = m_Settings.shadowCameraLod && m_CullOwner != null ? m_CullOwnerLod : Vector4.zero;
+            sv.basePlaneCount = sv.planeCount;
             if (m_Settings.shadowCasterFrustum && m_CullOwner != null && split.sphereRadius > 0f)
                 AppendCasterPlanes(ref sv, m_CullOwner, split);
             string reason = ReceiverCullingBlocker(ctx);
             sv.receiverCulling = reason == null;
             LastShadowDecision = $"{sv.name} of {(m_CullOwner != null ? m_CullOwner.name : "<no camera>")}: {reason ?? "receiver culling"}";
+            sv.vsmEntry1 = VsmEntryFor(sv, ctx, splitIndex) + 1; // M13: cached pages
         }
 
         // M11 follow-up: casters of a directional split bounded like Unity's shadow caster culling - the
@@ -351,8 +420,10 @@ namespace UNanite
             cmd.SetComputeIntParams(m_Cull, Ids.OccHzb, r.width0, r.height0, r.levels, 0); // GL-style light depth: larger = farther
             cmd.SetComputeMatrixParam(m_Cull, Ids.OccViewProj, v.lightViewProj);
             cmd.SetComputeVectorParam(m_Cull, Ids.OccScreen, new Vector4(r.screenWidth, r.screenHeight, 0, 0));
-            m_BoundHzb = r.hzb;
+            m_BoundHzb = m_HzbOverride ?? r.hzb; // M13: dirty pyramids of cached splits
         }
+
+        GraphicsBuffer m_HzbOverride;
 
         // Emits the two raster draws of a shadow-raster split: procedural, 384 vertices per visible
         // record (args by PrepareShadowRaster); the visible offset tells VgShadowRaster.shader its view
@@ -458,6 +529,10 @@ namespace UNanite
                     pending[first + i] = (view, slot);
                     DeferredShadowSplitCount++;
                 }
+                // M13: cached splits: page upkeep, dirty-page culling and raster; their per-frame
+                // culling below skips the shadow-raster bins
+                if (m_VsmPool != null)
+                    RenderVsmBatch(cmd, camera, pending, first, count);
                 for (int sub = 0; sub < count; sub += k_MaxBatchSplits)
                 {
                     int n = Mathf.Min(k_MaxBatchSplits, count - sub);

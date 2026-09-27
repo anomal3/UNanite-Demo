@@ -1,0 +1,316 @@
+// M13 virtual shadow maps (VgWorld.Vsm.cs, VgVsm.hlsl).
+//
+//   Begin           counters of the frame (dirty list, overflow, composite counts) -> 0
+//   Release         per slot of an entry: pages of reset entries, pages unused for `max age` frames
+//                   and pages whose slot now belongs to another global page (a cascade moved) go back
+//                   to the free list
+//   Invalidate      per (moved / added / removed caster sphere, entry): its pages lose their content
+//   Mark            per page of an entry's window: needed = a receiver of the camera within one page
+//                   (receiver pyramid); needed pages get a physical page (free list) and are dirty when
+//                   their content is missing or stale; composite list of the needed pages
+//   Finalize        indirect args: page clears, per-entry composite draws
+//   ClearPages      one group per dirty page: its pool texels -> 0 (no caster)
+//   DirtyPyramid    level 0 of an entry's "dirty pyramid" in the receiver layout (VgWorld.Shadows.cs):
+//                   +3e38 over dirty pages, -3e38 elsewhere; the batched shadow culling then keeps only
+//                   casters over dirty pages (VgCull.compute receiver test)
+
+#pragma kernel Begin
+#pragma kernel Release
+#pragma kernel Invalidate
+#pragma kernel Mark
+#pragma kernel Finalize
+#pragma kernel ClearPages
+#pragma kernel DirtyPyramid
+
+#include "../../ShaderLibrary/VgVsm.hlsl"
+
+StructuredBuffer<VgVsmEntry> VG_VsmEntries;
+RWStructuredBuffer<uint4> VG_VsmPages;
+RWStructuredBuffer<uint> VG_VsmFree;         // [0] count, [1..] free physical pages
+RWStructuredBuffer<uint> VG_VsmCounters;     // [0] dirty pages, [1] overflow (pages not allocated), [2] pages marked, [16 + entry] composite pages
+RWStructuredBuffer<uint> VG_VsmDirty;        // dirty physical pages of the frame
+RWStructuredBuffer<uint> VG_VsmList;         // per entry (from its table base): slots of the needed pages
+RWStructuredBuffer<uint> VG_VsmArgs;         // [0..2] ClearPages dispatch, then 4 uints per entry (composite draw)
+StructuredBuffer<float4> VG_VsmSpheres;      // invalidation spheres (world xyz, radius)
+StructuredBuffer<float> VG_Receivers;        // receiver pyramids of the batch (VgShadowReceivers.compute)
+RWStructuredBuffer<float> VG_VsmHzbOut;      // dirty pyramids of the batch (level 0 written here)
+RWTexture2D<uint> _VgVsmPool;
+
+StructuredBuffer<uint4> VG_VsmBatch;         // per entry of a dispatch (SV_DispatchThreadID.z, Invalidate: .y): x entry, y receiver batch index of its split
+
+uint4 _VsmParams;     // x: entries in VG_VsmBatch, y: frame, z: sphere count, w: dirty-list capacity
+uint4 _VsmPyramid;    // x: texels per pyramid (receiver / dirty), z: level-0 size, w: level count
+
+// ---------------------------------------------------------------------------------------------
+
+[numthreads(64, 1, 1)]
+void Begin(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < 16 + 128)
+        VG_VsmCounters[id.x] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void Release(uint3 id : SV_DispatchThreadID)
+{
+    VgVsmEntry e = VG_VsmEntries[VG_VsmBatch[id.z].x];
+    uint W = e.table.y;
+    if (id.x >= W * W)
+        return;
+    uint idx = e.table.x + id.x;
+    uint4 p = VG_VsmPages[idx];
+    uint phys = p.x & 0xFFFFu;
+    bool release = (e.window.w & VSM_ENTRY_RESET) != 0;
+    if (phys != VSM_NONE && !release)
+    {
+        // the window's page of this slot (cascades: the unique page of [first, first + W) mod W)
+        int2 first = VsmFirstPage(e);
+        int2 slot = int2(id.x % W, id.x / W);
+        int2 page = first + int2(VsmMod(slot.x - first.x, (int)W), VsmMod(slot.y - first.y, (int)W));
+        release = p.y != VsmKey(page) || _VsmParams.y - p.z > e.table.w;
+    }
+    if (release)
+    {
+        if (phys != VSM_NONE)
+        {
+            uint n;
+            InterlockedAdd(VG_VsmFree[0], 1u, n);
+            VG_VsmFree[1 + n] = phys;
+        }
+        VG_VsmPages[idx] = uint4(VSM_NONE, VSM_NO_KEY, 0, 0);
+    }
+}
+
+// One thread per (sphere, entry of the dispatch): clears the content of the pages the sphere's
+// bounds cover in the entry's current grid.
+[numthreads(64, 1, 1)]
+void Invalidate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _VsmParams.z)
+        return;
+    VgVsmEntry e = VG_VsmEntries[VG_VsmBatch[id.y].x];
+    uint W = e.table.y;
+    if (W == 0)
+        return;
+    float4 s = VG_VsmSpheres[id.x];
+    float res = (float)e.window.z;
+    float2 lo = 1e30, hi = -1e30;
+    bool behind = false;
+    [unroll]
+    for (uint i = 0; i < 8; ++i)
+    {
+        float3 c = s.xyz + s.w * float3((i & 1) ? 1 : -1, (i & 2) ? 1 : -1, (i & 4) ? 1 : -1);
+        float4 clip = VsmClip(e, c);
+        if (clip.w <= 1e-5)
+        {
+            behind = true;
+            break;
+        }
+        float2 ndc = clip.xy / clip.w;
+        float2 t = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * res;
+        lo = min(lo, t);
+        hi = max(hi, t);
+    }
+    if (behind)
+    {
+        lo = 0;
+        hi = res;
+    }
+    lo = max(lo - 1.0, 0.0);
+    hi = min(hi + 1.0, res - 1.0);
+    if (lo.x > hi.x || lo.y > hi.y)
+        return;
+    int2 p0 = int2(VsmPageOf((int)lo.x + e.window.x), VsmPageOf((int)lo.y + e.window.y));
+    int2 p1 = int2(VsmPageOf((int)hi.x + e.window.x), VsmPageOf((int)hi.y + e.window.y));
+    for (int y = p0.y; y <= p1.y; ++y)
+        for (int x = p0.x; x <= p1.x; ++x)
+        {
+            uint idx = e.table.x + VsmSlot(e, int2(x, y));
+            if (VG_VsmPages[idx].y == VsmKey(int2(x, y)))
+                InterlockedAnd(VG_VsmPages[idx].x, ~VSM_VALID);
+        }
+}
+
+// ---- receiver pyramid (VgShadowReceivers.compute layout: max pyramid, level 0 = 256 x 256 over the
+// split's cull NDC, "screen" of 2 x that in pixels, D3D-style rows) --------------------------------
+
+uint LevelOffset(uint level)
+{
+    uint offset = 0;
+    for (uint l = 0; l < level; ++l)
+    {
+        uint s = max(_VsmPyramid.z >> l, 1u);
+        offset += s * s;
+    }
+    return offset;
+}
+
+float2 LocalToCull(VgVsmEntry e, float2 t)
+{
+    return float2(dot(e.localToCull0.xy, t) + e.localToCull0.z, dot(e.localToCull1.xy, t) + e.localToCull1.z);
+}
+
+// True when any receiver lies in the local texel rectangle [lo, hi] (receiver pyramid from `base`).
+bool AnyReceiver(VgVsmEntry e, uint base, float2 lo, float2 hi)
+{
+    float2 ndcMin = 1e30, ndcMax = -1e30;
+    [unroll]
+    for (uint i = 0; i < 4; ++i)
+    {
+        float2 ndc = LocalToCull(e, float2((i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y));
+        ndcMin = min(ndcMin, ndc);
+        ndcMax = max(ndcMax, ndc);
+    }
+    float screen = 2.0 * _VsmPyramid.z;
+    float2 pMin = float2(ndcMin.x * 0.5 + 0.5, 0.5 - ndcMax.y * 0.5) * screen;
+    float2 pMax = float2(ndcMax.x * 0.5 + 0.5, 0.5 - ndcMin.y * 0.5) * screen;
+    pMin = max(pMin, 0.0);
+    pMax = min(pMax, screen - 1.0);
+    if (pMin.x > pMax.x || pMin.y > pMax.y)
+        return false;
+    uint2 a = (uint2)pMin, b = (uint2)pMax;
+    uint size = max(b.x - a.x, b.y - a.y) + 1;
+    uint level = size <= 2 ? 0 : (uint)firstbithigh(size - 1);
+    level = min(level, _VsmPyramid.w - 1);
+    uint width = max(_VsmPyramid.z >> level, 1u);
+    uint2 ta = min(a >> (level + 1), width - 1), tb = min(b >> (level + 1), width - 1);
+    uint offset = base + LevelOffset(level);
+    for (uint y = ta.y; y <= tb.y; ++y)
+        for (uint x = ta.x; x <= tb.x; ++x)
+            if (VG_Receivers[offset + y * width + x] > -1e38)
+                return true;
+    return false;
+}
+
+// Thread per page of the entry's window (z: entry of the batch).
+[numthreads(8, 8, 1)]
+void Mark(uint3 id : SV_DispatchThreadID)
+{
+    uint4 batch = VG_VsmBatch[id.z];
+    uint entry = batch.x;
+    VgVsmEntry e = VG_VsmEntries[entry];
+    uint W = e.table.y;
+    int res = e.window.z;
+    int2 first = VsmFirstPage(e);
+    int2 last = int2(VsmPageOf(e.window.x + res - 1), VsmPageOf(e.window.y + res - 1));
+    int2 page = first + int2(id.xy);
+    if (any(page > last))
+        return;
+    uint idx = e.table.x + VsmSlot(e, page);
+    uint4 p = VG_VsmPages[idx];
+    uint key = VsmKey(page);
+    if (p.y != key)
+        p = uint4(VSM_NONE, key, 0, 0); // released (or never used) slot
+
+    // needed: a receiver within one page of it (PCF / PCSS kernels, normal bias)
+    float2 lo = float2(page * VSM_PAGE - e.window.xy) - VSM_PAGE;
+    float2 hi = lo + 3.0 * VSM_PAGE;
+    bool needed = AnyReceiver(e, batch.y * _VsmPyramid.x, lo, hi);
+    uint phys = p.x & 0xFFFFu;
+    if (needed && phys == VSM_NONE)
+    {
+        uint n;
+        InterlockedAdd(VG_VsmFree[0], 0xFFFFFFFFu, n); // pop
+        if ((int)n > 0)
+            phys = VG_VsmFree[n];
+        else
+        {
+            InterlockedAdd(VG_VsmFree[0], 1u); // undo
+            InterlockedAdd(VG_VsmCounters[1], 1u);
+            needed = false;
+        }
+        p.x = phys; // no flags: new content
+    }
+    if (needed)
+    {
+        bool valid = (p.x & VSM_VALID) != 0 && p.w == e.table.z;
+        uint flags = VSM_VALID | (valid ? 0u : VSM_DIRTY);
+        p.x = phys | flags;
+        p.z = _VsmParams.y;
+        p.w = e.table.z;
+        if (!valid)
+        {
+            uint d;
+            InterlockedAdd(VG_VsmCounters[0], 1u, d);
+            if (d < _VsmParams.w)
+                VG_VsmDirty[d] = phys;
+        }
+        uint c;
+        InterlockedAdd(VG_VsmCounters[16 + entry], 1u, c);
+        VG_VsmList[e.table.x + c] = idx;
+        InterlockedAdd(VG_VsmCounters[2], 1u);
+    }
+    else
+        p.x &= ~VSM_DIRTY;
+    VG_VsmPages[idx] = p;
+}
+
+// One thread: the ClearPages dispatch of the batch and the composite draws of its entries (other
+// entries keep their args: their cameras draw them).
+[numthreads(1, 1, 1)]
+void Finalize(uint3 id : SV_DispatchThreadID)
+{
+    VG_VsmArgs[0] = min(VG_VsmCounters[0], _VsmParams.w);
+    VG_VsmArgs[1] = 1;
+    VG_VsmArgs[2] = 1;
+    for (uint i = 0; i < _VsmParams.x; ++i)
+    {
+        uint entry = VG_VsmBatch[i].x;
+        uint n = VG_VsmCounters[16 + entry];
+        uint a = 4 + entry * 4;
+        VG_VsmArgs[a + 0] = n * 6;
+        VG_VsmArgs[a + 1] = n > 0 ? 1 : 0;
+        VG_VsmArgs[a + 2] = 0;
+        VG_VsmArgs[a + 3] = 0;
+    }
+}
+
+// One group per dirty page (16 x 16 threads, 8 x 8 texels each).
+[numthreads(16, 16, 1)]
+void ClearPages(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint phys = VG_VsmDirty[gid.x];
+    uint2 origin = VsmPhysOrigin(phys) + gtid.xy * 8;
+    for (uint y = 0; y < 8; ++y)
+        for (uint x = 0; x < 8; ++x)
+            _VgVsmPool[origin + uint2(x, y)] = 0;
+}
+
+float2 CullToLocal(VgVsmEntry e, float2 ndc)
+{
+    return float2(dot(e.cullToLocal0.xy, ndc) + e.cullToLocal0.z, dot(e.cullToLocal1.xy, ndc) + e.cullToLocal1.z);
+}
+
+bool DirtyAt(VgVsmEntry e, float2 local)
+{
+    int res = e.window.z;
+    if (local.x < 0 || local.y < 0 || local.x >= res || local.y >= res)
+        return false;
+    int2 g = int2(local) + e.window.xy;
+    int2 page = int2(VsmPageOf(g.x), VsmPageOf(g.y));
+    uint4 p = VG_VsmPages[e.table.x + VsmSlot(e, page)];
+    return p.y == VsmKey(page) && (p.x & VSM_DIRTY) != 0;
+}
+
+// Level 0 of the entry's dirty pyramid: a texel is dirty when a corner (or its centre) lies in a
+// dirty page (texels are never larger than a page, so that finds every overlap).
+[numthreads(8, 8, 1)]
+void DirtyPyramid(uint3 id : SV_DispatchThreadID)
+{
+    uint size = _VsmPyramid.z;
+    if (id.x >= size || id.y >= size)
+        return;
+    uint4 batch = VG_VsmBatch[id.z];
+    VgVsmEntry e = VG_VsmEntries[batch.x];
+    bool dirty = false;
+    [unroll]
+    for (uint i = 0; i < 5; ++i)
+    {
+        float2 f = i == 4 ? float2(0.5, 0.5) : float2((i & 1) ? 1.0 : 0.0, (i & 2) ? 1.0 : 0.0);
+        // texel -> cull NDC (D3D-style rows: row 0 at ndc.y = +1)
+        float2 uv = (float2(id.xy) + f) / size;
+        float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        dirty = dirty || DirtyAt(e, CullToLocal(e, ndc));
+    }
+    VG_VsmHzbOut[batch.y * _VsmPyramid.x + id.y * size + id.x] = dirty ? 3e38 : -3e38;
+}

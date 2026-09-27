@@ -26,6 +26,9 @@ Everything is on the [Releases](https://github.com/anomal3/UNanite-Demo/releases
 | `UNanite_0.11.2-preview.pdf` | Plugin description and manual |
 | `UNaniteDemo_Scene.unitypackage` | Only the demo scene with its assets (import after the plugin) |
 
+The release files are still version 0.11.2-preview. The repository itself already has the plugin **0.13.0-preview**
+(see "What is new" below), a new release with the build will come later.
+
 Or clone this repository and open it with **Unity 6000.4.4f1** (the plugin is already inside, in `Assets/UNanite`).
 Open `Assets/UNaniteDemo/UNaniteDemo.unity` and press Play. First import builds the virtual geometry of the rocks,
 it takes a couple of minutes.
@@ -62,6 +65,22 @@ In scenes that already have good LODs the difference is much smaller.
 | **C** | clear the rocks |
 | F2 | stats, F1 / Esc - help window, F10 - quit |
 
+## What is new in 0.13.0-preview (in the repository, not yet in the release files)
+
+- **URP: basic support (experimental).** UNanite now runs in URP 17 too, but only with the simpler draw path: no
+  visibility buffer, no occlusion culling and no special shadow raster, this things are HDRP only for now. I tested
+  it only in one low-poly URP project, so expect problems.
+- **Cheaper shadows.** Shadow casters that are completely outside of the shadow map are not drawn anymore (before
+  they were drawn when HDRP makes the split culling wider, for example with ray traced shadows). In the demo scene
+  the shadow pass was 0.52 ms and now is 0.38 ms, the picture is the same.
+- Shadows of every camera are culled with the right camera now (before a reflection probe camera could take it).
+- **Virtual shadow maps and runtime virtual texture for terrain - experimental, switched off.** I made both:
+  shadows are cached in pages and only changed pages are drawn again, terrain layers are baked into a cached
+  texture. They work and the picture is the same, but honestly in my test scenes they don't make the frame
+  faster: UNanite shadows and terrain were already cheap, and managing the cache cost about the same as it saves.
+  HDRP also rebuilds its shadow cascades every frame when the camera zoom changes, so the cache is reset often.
+  You can try them in the settings (`virtualShadowMaps`, `terrainVirtualTexture`).
+
 ## What is working
 
 - Conversion of MeshRenderers (and LOD0 of LODGroups) to virtual geometry with one menu command
@@ -73,8 +92,8 @@ In scenes that already have good LODs the difference is much smaller.
 - Destruction: the mesh is fractured on import, every piece is also virtual geometry
 - Player builds on Windows / DirectX 12
 
-**Not yet:** skinned meshes (the character in the demo is regular Unity), URP, mobile, Vulkan and AMD cards are not
-tested. I tested it only on RTX 3060, so if you will run it on other hardware please tell me how it goes.
+**Not yet:** skinned meshes (the character in the demo is regular Unity), full URP support (only basic), mobile,
+Vulkan and AMD cards are not tested. I tested it only on RTX 3060, so if you will run it on other hardware please tell me how it goes.
 
 ## Plugin in your project
 
@@ -89,15 +108,15 @@ More details are in the PDF on the Releases page.
 
 I am one developer and I make UNanite alone, in my free time after work. I am working on it since this summer:
 first was the cluster hierarchy and GPU culling, then the visibility buffer, shadows and streaming, last month I add
-terrain, foliage and destruction. Next big step is **virtual shadow maps** (cached paged shadows, like in Unreal), they
-will make shadows much cheaper in big scenes. When the next version will be ready, I will post it here.
+terrain, foliage and destruction. After that I tried **virtual shadow maps** (cached paged shadows, like in Unreal).
+I expected that they will make shadows much cheaper, but in my tests the gain was not there (see "What is new"), so
+for now they stay an experiment. When the next version will be ready, I will post it here.
 
 If you find a bug or have a scene where UNanite works bad, please open an issue, it helps a lot.
 
 ## Support the project
 
-If you decide to support the project and the future of this Nanite system (virtual shadow maps are next), you can
-donate USDT:
+If you decide to support the project and the future of this Nanite system, you can donate USDT:
 
 **USDT (TRC-20):** `TYdALudExGBdgWYEqiZTZ6J6kyHf39U8pq`
 

@@ -81,6 +81,15 @@ Metal the raster also writes hardware barycentrics, so the resolve shades each f
 re-evaluating the vertex graph, and the motion vectors of the moved vertices (TAA, motion blur of
 swaying leaves).
 
+Experimental, off by default (M12, M13; `VirtualGeometrySettings`) - validated by render tests, but
+measured no faster than the default path in the test scenes (see `Documentation~/Milestones.md`):
+* `terrainVirtualTexture`: VG terrains shade from a runtime virtual texture - their blended layers
+  are baked into cached 128 × 128 tiles on demand (GPU feedback from the visibility buffer) instead
+  of blending up to 8 layers per pixel every frame; close-up detail keeps the direct blend.
+* `virtualShadowMaps`: VG shadow casters of every-frame lights are cached in 128 × 128 pages; only
+  pages whose casters moved, appeared or were never rendered are rasterised again, the rest is copied
+  into HDRP's shadow atlas (directional cascades scroll their pages with the camera).
+
 ## Native builder
 
 `Native~/` (C++17, meshoptimizer 1.2, MIT). Build (Windows, VS 2019+ / CMake 3.20+):

@@ -321,8 +321,10 @@ namespace UNanite
             EnsureBinCapacity(16);
             EnsureInstanceCapacity(256);
             InitVisibility();
+            InitRvt();
             InitSoftwareRaster();
             InitShadows();
+            InitVsm();
             InitPulled();
             UploadLodSwitches();
 
@@ -353,8 +355,10 @@ namespace UNanite
             Application.quitting -= DisposeInstance;
 
             DisposeVisibility();
+            DisposeRvt();
             DisposeSoftwareRaster();
             DisposeShadows();
+            DisposeVsm();
             DisposeStreaming();
             DisposeLightmaps();
             DisposePulled();
@@ -766,6 +770,7 @@ namespace UNanite
 
         void MarkDirty(int handle)
         {
+            VsmTouch(handle); // M13: cached shadow pages under changed casters
             m_DirtyMin = Mathf.Min(m_DirtyMin, handle);
             m_DirtyMax = Mathf.Max(m_DirtyMax, handle);
         }
@@ -838,8 +843,10 @@ namespace UNanite
             }
 
             BeginVisibilityFrame();
+            BeginRvtFrame();
             BeginPulledFrame();
             BeginShadowFrame();
+            BeginVsmFrame();
             if (!m_Settings.freezeCulling && m_Frozen.Count > 0)
                 m_Frozen.Clear();
 
@@ -856,6 +863,7 @@ namespace UNanite
         void OnEndContextRendering(ScriptableRenderContext context, List<Camera> cameras)
         {
             RequestStreamingFeedback();
+            RequestRvtFeedback();
             if (m_ViewSlotsUsed == 0 || m_StatsPending || !SystemInfo.supportsAsyncGPUReadback)
                 return;
             var names = m_ViewNames.ToArray();
@@ -921,6 +929,10 @@ namespace UNanite
             public Vector4 splitSphere;          // split culling sphere (radius <= 0: none)
             public int receiverBatchIndex;       // its receiver pyramid inside the current batch
             public int lodFadeSlot;              // M11 animated LOD crossfade state of the camera (-1: none)
+            public int basePlaneCount;           // M13: planes of the split itself (before the caster frustum)
+            public int vsmEntry1;                // M13: virtual-shadow-map cache entry + 1 (0: none)
+            public int vsmSlot;                  // M13: view slot of the cached (dirty-page) culling
+            public int VsmEntry => vsmEntry1 - 1;
         }
 
         readonly Vector4[] m_PlaneScratch = new Vector4[16];
@@ -931,13 +943,22 @@ namespace UNanite
                 return default;
             if (ctx.viewType != BatchCullingViewType.Camera && ctx.viewType != BatchCullingViewType.Light)
                 return default;
+            // every draw is on layer 0 (EmitDrawCommands): views that cannot see it (a far camera of a
+            // camera stack that only draws the sky layer) would cull and expand for nothing
+            if ((ctx.cullingLayerMask & 1u) == 0)
+                return default;
 
             var subViews = BuildSubViews(ctx);
             if (subViews.Count == 0)
                 return default;
 
             int maxViews = Mathf.Max(1, m_Settings.maxViewsPerFrame);
-            if (m_ViewSlotsUsed + subViews.Count > maxViews)
+            // M13: cached shadow splits cull their dirty pages in a slot of their own
+            int vsmViews = 0;
+            for (int i = 0; i < subViews.Count; ++i)
+                if (subViews[i].VsmEntry >= 0)
+                    vsmViews++;
+            if (m_ViewSlotsUsed + subViews.Count + vsmViews > maxViews)
             {
                 if (!m_WarnedViews)
                     Debug.LogWarning($"UNanite: more than {maxViews} views in one frame; raise VirtualGeometrySettings.maxViewsPerFrame.");
@@ -946,17 +967,27 @@ namespace UNanite
             }
 
             int firstSlot = m_ViewSlotsUsed;
+            int nextVsmSlot = firstSlot + subViews.Count;
             m_Cmd.Clear();
             for (int i = 0; i < subViews.Count; ++i)
-            {
                 m_ViewNames.Add(subViews[i].name);
-                if (subViews[i].receiverCulling)
-                    RecordShadowPlaceholder(m_Cmd, subViews[i], firstSlot + i); // culled in the custom pass
+            for (int i = 0; i < subViews.Count; ++i)
+            {
+                var sv = subViews[i];
+                if (sv.VsmEntry >= 0)
+                {
+                    sv.vsmSlot = nextVsmSlot++;
+                    subViews[i] = sv;
+                    m_ViewNames.Add(sv.name + " (VSM pages)");
+                    RecordVsmPlaceholder(m_Cmd, sv);
+                }
+                if (sv.receiverCulling)
+                    RecordShadowPlaceholder(m_Cmd, sv, firstSlot + i); // culled in the custom pass
                 else
-                    RecordView(m_Cmd, subViews[i], firstSlot + i);
-                RegisterVisibilityCamera(subViews[i], firstSlot + i);
+                    RecordView(m_Cmd, sv, firstSlot + i);
+                RegisterVisibilityCamera(sv, firstSlot + i);
             }
-            m_ViewSlotsUsed += subViews.Count;
+            m_ViewSlotsUsed += subViews.Count + vsmViews;
             Graphics.ExecuteCommandBuffer(m_Cmd);
             m_Cmd.Clear();
 
@@ -1034,7 +1065,7 @@ namespace UNanite
                     sv.lodB = 1f / Mathf.Tan(fov * 0.5f * Mathf.Deg2Rad) * 0.5f * res / s.shadowTexelError;
                 }
                 sv.planes = CopyPlanes(ctx.cullingPlanes, split.cullingPlaneOffset, split.cullingPlaneCount, out sv.planeCount);
-                ConfigureShadowView(ref sv, ctx, split);
+                ConfigureShadowView(ref sv, ctx, split, i);
                 result.Add(sv);
             }
             return result;
@@ -1120,7 +1151,28 @@ namespace UNanite
             BindHlod(cmd, kernel);
         }
 
-        int DebugModeOf(in SubView v) => (v.flags & k_ViewFlagShadow) == 0 ? (int)m_Settings.debugView : 0;
+        int DebugModeOf(in SubView v) => (v.flags & k_ViewFlagShadow) == 0 ? (int)DebugView : 0;
+
+        static bool? s_DebugViewSupported;
+
+        /// <summary>
+        /// The settings' debug view where its shader runs, else none: the debug shader is HDRP's, and in
+        /// another pipeline (URP) every bin would be drawn with the error shader instead of its material.
+        /// </summary>
+        VgDebugView DebugView
+        {
+            get
+            {
+                if (m_Settings.debugView == VgDebugView.None)
+                    return VgDebugView.None;
+                if (s_DebugViewSupported == null)
+                {
+                    var shader = Shader.Find("Hidden/UNanite/DebugBRG");
+                    s_DebugViewSupported = shader != null && shader.isSupported;
+                }
+                return s_DebugViewSupported.Value ? m_Settings.debugView : VgDebugView.None;
+            }
+        }
 
         // M11 density LOD constants (VgFormat.hlsl VgDensityLodScale)
         Vector4 DensityLodParams()
@@ -1255,7 +1307,7 @@ namespace UNanite
 
         BatchMaterialID? GetDebugMaterial()
         {
-            var mode = m_Settings.debugView;
+            var mode = DebugView;
             if (mode == VgDebugView.None)
                 return null;
             if (m_DebugMaterial == null)
@@ -1285,7 +1337,7 @@ namespace UNanite
             int indirectCount = 0, proceduralCount = 0;
             for (int v = 0; v < subViews.Count; ++v)
             {
-                proceduralCount += ShadowRasterDrawCount(subViews[v]);
+                proceduralCount += ShadowRasterDrawCount(subViews[v]) + VsmCompositeDrawCount(subViews[v]);
                 for (int b = 0; b < m_BinMaterials.Count; ++b)
                 {
                     if (m_BinRefCount[b] <= 0 || IsShadowRasterBin(subViews[v], b))
@@ -1323,6 +1375,8 @@ namespace UNanite
                 int slot = firstSlot + v;
                 if (subViews[v].shadowRaster)
                     cp = EmitShadowRasterDraws(procedural, cp, subViews[v], slot, windowSize);
+                if (subViews[v].VsmEntry >= 0)
+                    cp = EmitVsmCompositeDraw(procedural, cp, subViews[v], windowSize); // M13 cached pages
                 for (int b = 0; b < m_BinMaterials.Count; ++b)
                 {
                     if (m_BinRefCount[b] <= 0 || IsShadowRasterBin(subViews[v], b))

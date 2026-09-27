@@ -72,6 +72,8 @@ Shader "Hidden/UNanite/DebugView"
 
     SubShader
     {
+        // HDRP only: URP projects skip it instead of failing on the HDRP includes
+        PackageRequirements { "com.unity.render-pipelines.high-definition" }
         Tags { "RenderType" = "Opaque" "Queue" = "Geometry" }
 
         // HDRP draws forward-only opaques with ZTest Equal against its depth prepass, so the object

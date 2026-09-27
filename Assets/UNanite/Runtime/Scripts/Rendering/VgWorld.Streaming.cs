@@ -358,6 +358,7 @@ namespace UNanite
                     m_FreeStaging.Push(load.staging);
                     m_Loads.RemoveAt(i--);
                     m_StreamStats.pagesUploaded++;
+                    VsmOnPageCommitted(load.page); // M13: finer LODs of cached casters
                     m_StreamStats.bytesUploaded += load.size;
                     m_StreamStats.totalBytesUploaded += load.size;
                     progress = true;

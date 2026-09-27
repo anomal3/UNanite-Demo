@@ -15,8 +15,7 @@
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Sampling/SampleUVMapping.hlsl"
 #include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/MaterialUtilities.hlsl"
 
-TEXTURE2D(_VgTerrainHeightmap); // TerrainData.heightmapTexture: height / 2 in R (UnpackHeightmap)
-SAMPLER(sampler_VgTerrainHeightmap);
+#include "VgTerrainNormal.hlsl"
 
 // We don't use emission for terrain
 #define _EmissiveColor float3(0,0,0)
@@ -31,22 +30,10 @@ SAMPLER(sampler_VgTerrainHeightmap);
 #include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/Lit/LitDecalData.hlsl"
 #include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/TerrainLit/TerrainLitSurfaceData.hlsl"
 #include "Packages/com.unity.render-pipelines.high-definition/Runtime/Material/TerrainLit/TerrainLit_Splatmap.hlsl"
-
-// Central-difference normal of the heightmap at terrain UV `uv` (bilinear taps one sample apart),
-// the same formula the tile builder uses for vertex normals (VgTerrainSource.Normal).
-float3 VgTerrainNormal(float2 uv)
-{
-    float res = _VgTerrainParams.x;
-    float texel = _VgTerrainParams.y;
-    float2 tc = (uv * (res - 1.0) + 0.5) * texel;
-    float hl = UnpackHeightmap(SAMPLE_TEXTURE2D_LOD(_VgTerrainHeightmap, sampler_VgTerrainHeightmap, tc - float2(texel, 0), 0));
-    float hr = UnpackHeightmap(SAMPLE_TEXTURE2D_LOD(_VgTerrainHeightmap, sampler_VgTerrainHeightmap, tc + float2(texel, 0), 0));
-    float hd = UnpackHeightmap(SAMPLE_TEXTURE2D_LOD(_VgTerrainHeightmap, sampler_VgTerrainHeightmap, tc - float2(0, texel), 0));
-    float hu = UnpackHeightmap(SAMPLE_TEXTURE2D_LOD(_VgTerrainHeightmap, sampler_VgTerrainHeightmap, tc + float2(0, texel), 0));
-    float dx = (hr - hl) * _VgTerrainParams.z / (2.0 * _VgTerrainSpacing.x);
-    float dz = (hu - hd) * _VgTerrainParams.z / (2.0 * _VgTerrainSpacing.z);
-    return normalize(float3(-dx, 1.0, -dz));
-}
+#ifdef VG_TERRAIN_RVT
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/NormalSurfaceGradient.hlsl"
+#include "VgRvt.hlsl"
+#endif
 
 float3 VgConvertToNormalTS(float3 normalData, float3 tangentWS, float3 bitangentWS)
 {
@@ -66,23 +53,67 @@ void GetSurfaceAndBuiltinData(inout FragInputs input, float3 V, inout PositionIn
     // terrain lightmap uvs are always taken from uv0
     input.texCoord1 = input.texCoord2 = input.texCoord0;
 
-    TerrainLitSurfaceData terrainLitSurfaceData;
-    InitializeTerrainLitSurfaceData(terrainLitSurfaceData);
-    TerrainLitShade(uv, terrainLitSurfaceData);
+    float3 albedo = 0, normalTS = 0;
+    float ao = 1, smoothness = 0, metallic = 0;
+    float3 frameNormal;
 
-    // per-pixel normal from the heightmap; terrains are never rotated or scaled (Unity Terrain)
-    float3 normalWS = VgTerrainNormal(uv);
-    // flat terrain: tangent (1, 0, 0), bitangent (0, 0, 1) (see HDRP ConstructTerrainTangent)
-    float4 tangentWS = float4(cross(normalWS, float3(0, 0, 1)), -1);
-    input.tangentToWorld = BuildTangentToWorld(tangentWS, normalWS);
-    surfaceData.normalWS = normalWS;
+#ifdef VG_TERRAIN_RVT
+    // M12: the blended surface comes from the terrain's runtime virtual texture. Coarse derivatives
+    // give one level of detail per 2x2 quad, so the direct-blend branch is quad-uniform and its
+    // implicit derivatives stay valid. Detail finer than mip 0 (close to the camera) keeps the direct
+    // splat blend, crossfaded with the cache over one mip.
+    float2 duvdx = ddx_coarse(uv), duvdy = ddy_coarse(uv);
+    float virtualSize = exp2(_VgRvtParams.y);
+    float lod = _VgRvtParams.w > 0 ? VgRvtLod(duvdx * virtualSize, duvdy * virtualSize) : -2.0;
+    float directWeight = saturate(-lod);
+    VgRvtSurface cached = (VgRvtSurface)0;
+    if (directWeight < 1)
+    {
+        cached = VgRvtSample(_VgRvtParams, uv, duvdx, duvdy, max(lod, 0.0));
+        if (!cached.valid)
+            directWeight = 1; // not baked yet (the terrain's first frames)
+    }
+    // frame of the gradients: the heightmap normal where the direct blend runs, else the vertex normal
+    frameNormal = directWeight > 0 ? VgTerrainNormal(uv) : normalize(input.tangentToWorld[2]);
+#else
+    float directWeight = 1;
+    frameNormal = VgTerrainNormal(uv); // per-pixel normal from the heightmap (LOD-independent)
+#endif
+    // terrains are never rotated or scaled (Unity Terrain); flat tangent frame (HDRP ConstructTerrainTangent)
+    float3x3 frame = BuildTangentToWorld(VgTerrainTangent(frameNormal), frameNormal);
+
+#ifdef VG_TERRAIN_RVT
+    if (directWeight < 1)
+    {
+        albedo = cached.albedo;
+        ao = cached.ao;
+        smoothness = cached.smoothness;
+        metallic = cached.metallic;
+        normalTS = SurfaceGradientFromPerturbedNormal(frameNormal, cached.normalWS);
+    }
+    if (directWeight > 0)
+#endif
+    {
+        TerrainLitSurfaceData terrainLitSurfaceData;
+        InitializeTerrainLitSurfaceData(terrainLitSurfaceData);
+        TerrainLitShade(uv, terrainLitSurfaceData);
+        float3 directTS = VgConvertToNormalTS(terrainLitSurfaceData.normalData, frame[0], frame[1]);
+        albedo = lerp(albedo, terrainLitSurfaceData.albedo, directWeight);
+        ao = lerp(ao, terrainLitSurfaceData.ao, directWeight);
+        smoothness = lerp(smoothness, terrainLitSurfaceData.smoothness, directWeight);
+        metallic = lerp(metallic, terrainLitSurfaceData.metallic, directWeight);
+        normalTS = lerp(normalTS, directTS, directWeight);
+    }
+
+    input.tangentToWorld = frame;
+    surfaceData.normalWS = frameNormal;
     surfaceData.tangentWS = normalize(input.tangentToWorld[0].xyz);
     surfaceData.geomNormalWS = input.tangentToWorld[2];
 
-    surfaceData.baseColor = terrainLitSurfaceData.albedo;
-    surfaceData.perceptualSmoothness = terrainLitSurfaceData.smoothness;
-    surfaceData.metallic = terrainLitSurfaceData.metallic;
-    surfaceData.ambientOcclusion = terrainLitSurfaceData.ao;
+    surfaceData.baseColor = albedo;
+    surfaceData.perceptualSmoothness = smoothness;
+    surfaceData.metallic = metallic;
+    surfaceData.ambientOcclusion = ao;
 
     surfaceData.subsurfaceMask = 0;
     surfaceData.transmissionMask = 0;
@@ -100,7 +131,6 @@ void GetSurfaceAndBuiltinData(inout FragInputs input, float3 V, inout PositionIn
     surfaceData.transmittanceMask = 0.0;
     surfaceData.specularOcclusion = 1.0;
 
-    float3 normalTS = VgConvertToNormalTS(terrainLitSurfaceData.normalData, input.tangentToWorld[0], input.tangentToWorld[1]);
 #ifdef DECAL_NORMAL_BLENDING
     if (_EnableDecals)
     {

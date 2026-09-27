@@ -1,0 +1,126 @@
+// M12 runtime virtual texture of VG terrains (VgWorld.Rvt.cs, VgRvt.hlsl).
+//
+//   ResetFeedback  clears the tile bits (a few hundred KB) and the request count, once per frame
+//   Feedback       one pixel per 4x4 block of a visibility-buffer camera (jittered over 16 frames):
+//                  terrain pixels of an RVT terrain -> terrain UV from depth, level of detail from the
+//                  UV footprint (neighbour pixels, the resolve's formula) -> marks the tile of that
+//                  mip and of the next one (trilinear) in VG_RvtBits; the first marker of a tile
+//                  appends it to VG_RvtRequests, which is read back by the CPU
+//   ScatterPages   page-table updates (index, value) of this frame
+//
+// Request = terrain << 25 | mip << 20 | ty << 10 | tx (VgRvtResidency.Key).
+
+#pragma kernel ResetFeedback
+#pragma kernel Feedback
+#pragma kernel ScatterPages
+
+#include "../../ShaderLibrary/VgFormat.hlsl"
+#define VG_RVT_NO_SAMPLING
+#include "../../ShaderLibrary/VgRvt.hlsl"
+
+Texture2DArray<uint2> _VgVisBuffer;
+StructuredBuffer<uint4> VG_Visible;
+StructuredBuffer<uint> VG_BinRvt;          // per bin: RVT terrain index + 1, 0 = none
+StructuredBuffer<float4> VG_RvtTerrains;   // per terrain: (origin x, origin z, 1 / size x, 1 / size z), (k, top mip, page base, 0)
+RWStructuredBuffer<uint> VG_RvtBits;       // one bit per page-table entry
+RWStructuredBuffer<uint> VG_RvtRequests;   // [0] count, [1..] requests
+StructuredBuffer<uint2> VG_RvtUpdates;     // (page-table index, value)
+RWStructuredBuffer<uint> VG_RvtPageTableOut;
+
+float4x4 _RvtInvViewProj;  // (ndc.xy, device depth) -> world, the camera's unjittered GPU matrices
+uint4 _RvtScreen;          // width, height, jitter x, jitter y
+uint4 _RvtParams;          // request capacity, update count, bit-set words, 0
+
+[numthreads(64, 1, 1)]
+void ResetFeedback(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < _RvtParams.z)
+        VG_RvtBits[id.x] = 0;
+    if (id.x == 0)
+        VG_RvtRequests[0] = 0;
+}
+
+[numthreads(1, 1, 1)]
+void ScatterPages(uint3 id : SV_DispatchThreadID)
+{
+    // single thread per update keeps things simple; updates are a few dozen per frame
+    for (uint i = 0; i < _RvtParams.y; ++i)
+    {
+        uint2 u = VG_RvtUpdates[i];
+        VG_RvtPageTableOut[u.x] = u.y;
+    }
+}
+
+bool TerrainPixel(int2 p, out uint terrain, out float3 world)
+{
+    terrain = 0;
+    world = 0;
+    if (any(p < 0) || any(p >= (int2)_RvtScreen.xy))
+        return false;
+    uint2 vis = _VgVisBuffer.Load(int4(p, 0, 0)).xy;
+    if (vis.x == 0)
+        return false;
+    uint record, triIndex;
+    VgUnpackVisibility(vis.x, record, triIndex);
+    uint rvt = VG_BinRvt[VG_Visible[record].w];
+    if (rvt == 0)
+        return false;
+    terrain = rvt - 1;
+    float2 ndc = float2((p.x + 0.5) / _RvtScreen.x * 2.0 - 1.0, 1.0 - (p.y + 0.5) / _RvtScreen.y * 2.0);
+    float4 w = mul(_RvtInvViewProj, float4(ndc, asfloat(vis.y), 1.0));
+    world = w.xyz / w.w;
+    return true;
+}
+
+void Mark(uint terrain, uint k, uint top, uint base, float2 uv, uint mip)
+{
+    uint side = 1u << (top - mip);
+    uint2 t = min((uint2)(saturate(uv) * side), side - 1u);
+    uint index = base + VgRvtTileIndex(top, mip, t);
+    uint bit = 1u << (index & 31u), old;
+    InterlockedOr(VG_RvtBits[index >> 5], bit, old);
+    if ((old & bit) != 0)
+        return;
+    uint slot;
+    InterlockedAdd(VG_RvtRequests[0], 1u, slot);
+    if (slot < _RvtParams.x)
+        VG_RvtRequests[1 + slot] = terrain << 25 | mip << 20 | t.y << 10 | t.x;
+}
+
+[numthreads(8, 8, 1)]
+void Feedback(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy) * 4 + int2(_RvtScreen.zw);
+    uint terrain;
+    float3 world;
+    if (!TerrainPixel(p, terrain, world))
+        return;
+    float4 t0 = VG_RvtTerrains[terrain * 2], t1 = VG_RvtTerrains[terrain * 2 + 1];
+    float2 uv = (world.xz - t0.xy) * t0.zw;
+    // UV derivatives from neighbour pixels of the same terrain (the other side at silhouettes)
+    uint tx, ty;
+    float3 wx, wy;
+    float2 dx = 0, dy = 0;
+    if (TerrainPixel(p + int2(1, 0), tx, wx) && tx == terrain)
+        dx = (wx.xz - world.xz) * t0.zw;
+    else if (TerrainPixel(p - int2(1, 0), tx, wx) && tx == terrain)
+        dx = (world.xz - wx.xz) * t0.zw;
+    else
+        return;
+    if (TerrainPixel(p + int2(0, 1), ty, wy) && ty == terrain)
+        dy = (wy.xz - world.xz) * t0.zw;
+    else if (TerrainPixel(p - int2(0, 1), ty, wy) && ty == terrain)
+        dy = (world.xz - wy.xz) * t0.zw;
+    else
+        return;
+    uint k = (uint)t1.x, top = (uint)t1.y, base = (uint)t1.z;
+    float size = exp2((float)k);
+    float lod = VgRvtLod(dx * size, dy * size);
+    if (lod < -1.0)
+        return; // the resolve blends the layers directly there
+    lod = clamp(lod, 0.0, (float)top);
+    uint m0 = (uint)lod;
+    Mark(terrain, k, top, base, uv, m0);
+    if (m0 < top)
+        Mark(terrain, k, top, base, uv, m0 + 1u);
+}

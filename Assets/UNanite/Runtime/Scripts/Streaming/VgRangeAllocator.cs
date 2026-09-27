@@ -20,6 +20,17 @@ namespace UNanite
                 m_Free.Add((0, capacity));
         }
 
+        /// <summary>Extends the space to `capacity` (the new part is free; live ranges keep their place).</summary>
+        public void Grow(int capacity)
+        {
+            if (capacity <= Capacity)
+                return;
+            int old = Capacity;
+            Capacity = capacity;
+            Used += capacity - old;
+            Free(old, capacity - old);
+        }
+
         /// <summary>Start of a free range of `count` (aligned to `alignment`), or -1.</summary>
         public int Allocate(int count, int alignment = 1)
         {

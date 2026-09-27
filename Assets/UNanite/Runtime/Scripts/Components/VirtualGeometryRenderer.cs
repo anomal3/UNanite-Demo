@@ -22,8 +22,11 @@ namespace UNanite
         [SerializeField] ShadowCastingMode m_ShadowCasting = ShadowCastingMode.On;
         [Tooltip("M9: triangles of the proxy mesh put in the ray tracing acceleration structure (ray-traced shadows, reflections, GI, path tracing). 0 = no proxy.")]
         [SerializeField, Min(0)] int m_RayTracingProxyTriangles;
+        [Tooltip("SpeedTree 8 wind of the converted tree (read from its Tree component at conversion); SpeedTree materials of the instance sway under the scene's WindZones like the terrain trees of VirtualGeometryTerrainTrees. Empty = static.")]
+        [SerializeField] VgSpeedTreeWindParams m_SpeedTreeWind;
 
         int m_Handle = -1;
+        int m_WindSlot = -1;
         VgWorld m_World;
 
 
@@ -50,6 +53,13 @@ namespace UNanite
         {
             get => m_RayTracingProxyTriangles;
             set { m_RayTracingProxyTriangles = Mathf.Max(0, value); Reregister(); }
+        }
+
+        /// <summary>SpeedTree 8 wind of this instance (null or invalid = static), e.g. VgSpeedTreeWindParams.FromRenderer of the source renderer.</summary>
+        public VgSpeedTreeWindParams SpeedTreeWind
+        {
+            get => m_SpeedTreeWind;
+            set { m_SpeedTreeWind = value; Reregister(); }
         }
 
         /// <summary>M9: the hidden ray tracing proxy renderer, or null.</summary>
@@ -106,8 +116,9 @@ namespace UNanite
             // M9: baked lightmap of the converted MeshRenderer (kept on the GameObject, disabled)
             int lightmapIndex = fallback != null ? fallback.lightmapIndex : -1;
             Vector4 lightmapScaleOffset = fallback != null ? fallback.lightmapScaleOffset : Vector4.zero;
+            m_WindSlot = m_SpeedTreeWind != null && m_SpeedTreeWind.IsValid ? m_World.AcquireSpeedTreeWind(m_SpeedTreeWind) : -1;
             m_Handle = m_World.AddInstance(m_Mesh, m_Materials, transform.localToWorldMatrix, m_ShadowCasting != ShadowCastingMode.Off,
-                                           lightmapIndex, lightmapScaleOffset);
+                                           lightmapIndex, lightmapScaleOffset, m_WindSlot);
             transform.hasChanged = false;
             CreateProxy();
 
@@ -121,8 +132,12 @@ namespace UNanite
             DestroyProxy();
             VgTransformTracker.Remove(this);
             if (m_Handle >= 0 && m_World != null && m_World == VgWorld.Instance)
+            {
                 m_World.RemoveInstance(m_Handle);
+                m_World.ReleaseSpeedTreeWind(m_WindSlot);
+            }
             m_Handle = -1;
+            m_WindSlot = -1;
             m_World = null;
         }
 
@@ -170,6 +185,7 @@ namespace UNanite
         internal void ReregisterTracked()
         {
             m_Handle = -1;
+            m_WindSlot = -1; // the old world's slots went with it
             m_World = null;
             Register();
         }

@@ -69,7 +69,11 @@ namespace UNanite
         void InitSoftwareRaster()
         {
             m_RasterLists = new GraphicsBuffer(GraphicsBuffer.Target.Structured, (1 + Mathf.Max(1, MaxVisibilityCameras)) * k_RasterLists * m_VisibleCapacity, 4);
+#if UNANITE_HDRP
             m_SwCs = Resources.Load<ComputeShader>("UNanite/VgSwRaster");
+#else
+            m_SwCs = null; // HDRP includes; the software raster feeds the HDRP-only visibility buffer
+#endif
             var merge = Shader.Find("Hidden/UNanite/SwMerge");
             if (!HasKernels(m_SwCs, "ClearSW", "RasterSW", "MergeTiles", "MergeArgs") || merge == null)
                 return;

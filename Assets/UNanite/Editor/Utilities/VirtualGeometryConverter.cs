@@ -180,10 +180,27 @@ namespace UNanite.Editor
                 }
             }
 
-            var vg = AssetDatabase.LoadAllAssetsAtPath(sidecar).OfType<VirtualGeometryMesh>().FirstOrDefault(v => v.SourceMeshName == mesh.name);
+            var vg = FindBuilt(AssetDatabase.LoadAllAssetsAtPath(sidecar).OfType<VirtualGeometryMesh>(), mesh);
             if (vg == null)
                 reason = "virtual geometry build failed (see console)";
             return vg;
+        }
+
+        // Sources can hold several meshes of the same name (glTF imports name every primitive after its
+        // material): among those, the one with the mesh's triangle count and bounds.
+        static VirtualGeometryMesh FindBuilt(IEnumerable<VirtualGeometryMesh> built, Mesh mesh)
+        {
+            var named = built.Where(v => v.SourceMeshName == mesh.name).ToList();
+            if (named.Count <= 1)
+                return named.FirstOrDefault();
+            long triangles = 0;
+            for (int s = 0; s < mesh.subMeshCount; ++s)
+                if (mesh.GetTopology(s) == MeshTopology.Triangles)
+                    triangles += mesh.GetIndexCount(s) / 3;
+            var b = mesh.bounds;
+            return named.OrderBy(v => v.Report.sourceTriangles == triangles ? 0 : 1)
+                        .ThenBy(v => (v.LocalBounds.center - b.center).sqrMagnitude + (v.LocalBounds.size - b.size).sqrMagnitude)
+                        .First();
         }
 
         /// <summary>M11: the mesh has UV components beyond uv0.xy / uv1.xy (e.g. SpeedTree 8 wind and LOD data).</summary>

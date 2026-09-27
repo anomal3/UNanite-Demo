@@ -248,8 +248,14 @@ namespace UNanite
             {
                 var applyWatch = Stopwatch.StartNew();
                 var td = Terrain.terrainData;
+                float res = td.heightmapResolution - 1;
                 foreach (var e in m_ApplyNextFrame)
+                {
                     td.SetHeights(e.x, e.z, e.heights);
+                    // M12: normals of the edited samples (+1 for the central differences) changed
+                    InvalidateVirtualTexture(Rect.MinMaxRect((e.x - 2) / res, (e.z - 2) / res,
+                        (e.x + e.heights.GetLength(1) + 1) / res, (e.z + e.heights.GetLength(0) + 1) / res));
+                }
                 m_ApplyNextFrame.Clear();
                 // SetHeights may replace the heightmap texture the resolve reads normals from
                 if (m_Resolve != null)

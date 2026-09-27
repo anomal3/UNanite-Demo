@@ -36,6 +36,7 @@ namespace UNanite
         // runtime state per node (meshes change after edits)
         VgTerrainNode[] m_Nodes;
         int[] m_Handles, m_Switches;
+        int m_RvtHandle = -1; // M12: runtime virtual texture registration
         Vector3 m_Position;
 
         public VirtualGeometryTerrainData Data
@@ -119,6 +120,9 @@ namespace UNanite
                 m_World.SetInstanceLod(m_Handles[i], m_Switches[i], parent >= 0 ? m_Switches[parent] : -1);
             }
 
+            // M12: the resolve samples the terrain's runtime virtual texture (baked on demand)
+            m_RvtHandle = m_World.RegisterTerrainRvt(m_Fallback, m_Resolve, m_Position, terrain.terrainData.size);
+
             // Unity draws the heightmap whenever virtual geometry does not (restored in Unregister;
             // never serialised as off by this component's lifetime alone)
             terrain.drawHeightmap = false;
@@ -132,6 +136,7 @@ namespace UNanite
             CancelEdits();
             if (m_Handles != null && m_World != null && m_World == VgWorld.Instance)
             {
+                m_World.UnregisterTerrainRvt(m_RvtHandle);
                 for (int i = 0; i < m_Handles.Length; ++i)
                 {
                     if (m_Handles[i] >= 0)
@@ -144,6 +149,7 @@ namespace UNanite
                 Terrain.drawHeightmap = true;
             m_Handles = null;
             m_Switches = null;
+            m_RvtHandle = -1;
             m_World = null;
             DestroyMaterials();
             DestroyRuntimeMeshes();
@@ -244,6 +250,7 @@ namespace UNanite
             var td = terrain.terrainData;
             if (m_Resolve != null)
                 SetupResolve(m_Resolve, terrain);
+            InvalidateVirtualTexture(new Rect(0, 0, 1, 1));
             if (m_Fallback != null)
             {
                 RenderBaseMap(td);
@@ -251,6 +258,13 @@ namespace UNanite
                 m_Fallback.SetFloat("_Smoothness", 0.2f);
                 m_Fallback.SetFloat("_Metallic", 0f);
             }
+        }
+
+        /// <summary>M12: re-bakes the cached virtual-texture tiles over a terrain-UV rectangle (after painting splats or layers outside <see cref="RefreshMaterials"/>).</summary>
+        public void InvalidateVirtualTexture(Rect uv)
+        {
+            if (m_RvtHandle >= 0 && m_World != null && m_World == VgWorld.Instance)
+                m_World.InvalidateTerrainRvt(m_RvtHandle, uv);
         }
 
         static void SetupResolve(Material m, Terrain terrain)
