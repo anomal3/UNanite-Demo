@@ -1,0 +1,20 @@
+{
+    "name": "VGeo.Editor",
+    "rootNamespace": "VGeo.Editor",
+    "references": [
+        "VGeo.Runtime",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.RenderPipelines.Core.Editor",
+        "Unity.Mathematics",
+        "Unity.Collections"
+    ],
+    "includePlatforms": ["Editor"],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

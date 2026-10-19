@@ -1,0 +1,20 @@
+{
+    "name": "VGeo.Samples.QuarryScene",
+    "rootNamespace": "VGeo.Samples.QuarryScene",
+    "references": [
+        "VGeo.Runtime",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.InputSystem"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        { "name": "com.unity.inputsystem", "expression": "1.0.0", "define": "VGEO_SAMPLE_INPUT_SYSTEM" }
+    ],
+    "noEngineReferences": false
+}

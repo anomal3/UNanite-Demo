@@ -2,7 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
-using UNanite;
+using VGeo;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -38,9 +38,9 @@ public sealed class UNaniteDemo : MonoBehaviour
         (VgDebugView.Materials, "Materials"),
     };
 
-    const string WelcomeTitle = "UNanite demo - work in progress";
+    const string WelcomeTitle = "VGeo (ex-UNanite) demo - work in progress";
     const string WelcomeText =
-        "Hi! This is small demo of UNanite, a virtual geometry system for Unity HDRP that I am making, " +
+        "Hi! This is small demo of VGeo (formerly UNanite), a virtual geometry system for Unity HDRP and URP that I am making, " +
         "something like Nanite in Unreal Engine. Please keep in mind that it is only a demo and the project " +
         "is still in work, so some bugs and strange things can happen.\n\n" +
         "What is working now:\n" +
@@ -51,14 +51,15 @@ public sealed class UNaniteDemo : MonoBehaviour
         "  - shadows, baked lightmaps, motion vectors, streaming (only the detail you see stay in GPU memory)\n" +
         "  - destruction: boulders break into pieces and every piece is also virtual geometry\n\n" +
         "Not working yet: skinned meshes (the character is regular Unity), transparent glass and water " +
-        "use normal Unity rendering, no URP and no mobile for now.\n\n" +
-        "Press U to turn UNanite off and see same scene with regular Unity MeshRenderers, and compare the FPS. " +
+        "use normal Unity rendering. This demo is HDRP; VGeo 0.15 also runs on URP. This is the last standalone " +
+        "version: VGeo continues as part of PURR (see the GitHub page and Discord).\n\n" +
+        "Press U to turn VGeo off and see same scene with regular Unity MeshRenderers, and compare the FPS. " +
         "The rocks don't have hand made LODs, this is exactly the case where virtual geometry help the most. " +
         "Made for HDRP on DirectX 12, I tested it on RTX 3060.";
 
     const string ControlsText =
         "WASD / mouse - walk and look      Shift - run      Space - jump\n" +
-        "U - UNanite on / off (compare with Unity MeshRenderers)\n" +
+        "U - VGeo on / off (compare with Unity MeshRenderers)\n" +
         "1..7 - view: lit, triangles, clusters, groups, LOD, instances, materials\n" +
         "R - rain of rocks on / off      B - drop a boulder      C - clear rocks\n" +
         "F2 - stats      F1 / Esc - this window      F10 - quit";
@@ -528,7 +529,7 @@ public sealed class UNaniteDemo : MonoBehaviour
         if (m_ShowStats)
         {
             m_Sb.Clear();
-            m_Sb.Append(m_UseVg ? "<b><color=#7CFC8A>UNanite ON</color></b>" : "<b><color=#FFB060>UNanite OFF - regular Unity MeshRenderers + LODGroups</color></b>").Append("   (U)\n");
+            m_Sb.Append(m_UseVg ? "<b><color=#7CFC8A>VGeo ON</color></b>" : "<b><color=#FFB060>VGeo OFF - regular Unity MeshRenderers + LODGroups</color></b>").Append("   (U)\n");
             if (m_FrameMs > 0f)
                 m_Sb.Append($"{1000f / m_FrameMs:F0} FPS   frame {m_FrameMs:F1} ms");
             if (m_GpuMs > 0f)

@@ -1,0 +1,23 @@
+{
+    "name": "VGeo.Samples.QuarryScene.Editor",
+    "rootNamespace": "VGeo.Samples.QuarryScene",
+    "references": [
+        "VGeo.Runtime",
+        "VGeo.Editor",
+        "VGeo.Samples.QuarryScene",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.RenderPipelines.HighDefinition.Runtime",
+        "Unity.Collections"
+    ],
+    "includePlatforms": ["Editor"],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": ["VGEO_SAMPLE_HDRP"],
+    "versionDefines": [
+        { "name": "com.unity.render-pipelines.high-definition", "expression": "17.0.0", "define": "VGEO_SAMPLE_HDRP" }
+    ],
+    "noEngineReferences": false
+}

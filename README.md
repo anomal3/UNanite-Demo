@@ -1,11 +1,19 @@
-# UNanite Demo - Nanite-style virtual geometry for Unity HDRP
+# UNanite / VGeo Demo - Nanite-style virtual geometry for Unity HDRP and URP
 
 ![UNanite](Docs/images/promo.png)
 
-> **This is a test build, not a finished product.** UNanite is still work in progress, it is not stable and some things
-> can break. But it is already available for download, so you can try the demo and the plugin in your own project.
+> **Project status: the standalone project is finished, development continues in PURR.**
+> UNanite was renamed to **VGeo**. **VGeo 0.15.0-preview** (HDRP 17 + URP 17) is the **last standalone release**.
+> VGeo will not be supported or developed as a separate package anymore. It lives on as a core feature of
+> **PURR** (Proper Universal-Resolution Render, my URP 17.4 fork for Unity 6.4), together with water, volumetric
+> clouds, ray tracing, frame generation and more.
+>
+> - Details, the PURR downloads and the change log: [Unity Discussions, post #48](https://discussions.unity.com/t/im-tired-of-putting-up-with-this-or-unanite-virtual-mesh-geometry/1737535/48)
+> - Updates, questions and support: [Discord "Unity - Another life"](https://discord.gg/VcmZjXuPRb)
+>
+> This repository and its releases stay online as they are. Issues here won't be fixed anymore, so please use Discord.
 
-Hi! UNanite is a virtual geometry system for Unity HDRP, it works similar to Nanite in Unreal Engine: every mesh is
+Hi! UNanite (now VGeo) is a virtual geometry system for Unity HDRP and URP, it works similar to Nanite in Unreal Engine: every mesh is
 split into small clusters of triangles with an automatic LOD hierarchy, the GPU decides every frame which clusters are
 visible and how detailed they must be, and draws them through a visibility buffer. You don't need to make LODs by hand
 and the number of triangles in the scene almost don't matter for the frame time.
@@ -21,15 +29,14 @@ Everything is on the [Releases](https://github.com/anomal3/UNanite-Demo/releases
 
 | File | What it is |
 |---|---|
-| `UNaniteDemo_Windows.zip` | Ready Windows build, no Unity needed. Unzip and run `UNaniteDemo.exe` |
-| `UNanite_0.11.2-preview.unitypackage` | Only the plugin, without scenes. Import it into your HDRP project |
-| `UNanite_0.11.2-preview.pdf` | Plugin description and manual |
-| `UNaniteDemo_Scene.unitypackage` | Only the demo scene with its assets (import after the plugin) |
+| `VGeoDemo_Windows.zip` | Ready Windows build, no Unity needed. Unzip and run `UNaniteDemo.exe` |
+| `VGeo_0.15.0-preview.unitypackage` | Only the plugin, without scenes. Import it into your HDRP 17.4 or URP 17.4 project |
+| `com.vgeo.virtualgeometry-0.15.0-preview.tgz` | The same plugin as a UPM package (Package Manager > Add package from tarball) |
+| `VGeoDemo_Scene.unitypackage` | Only the demo scene with its assets (HDRP, import after the plugin) |
 
-The release files are still version 0.11.2-preview. The repository itself already has the plugin **0.13.2-preview**
-(see "What is new" below), a new release with the build will come later.
+The old 0.11.2-preview files (with the PDF manual) are still on the Releases page.
 
-Or clone this repository and open it with **Unity 6000.4.4f1** (the plugin is already inside, in `Assets/UNanite`).
+Or clone this repository and open it with **Unity 6000.4.4f1** (the plugin is already inside, in `Assets/VGeo`).
 Open `Assets/UNaniteDemo/UNaniteDemo.unity` and press Play. First import builds the virtual geometry of the rocks,
 it takes a couple of minutes.
 
@@ -65,7 +72,23 @@ In scenes that already have good LODs the difference is much smaller.
 | **C** | clear the rocks |
 | F2 | stats, F1 / Esc - help window, F10 - quit |
 
-## What is new in 0.13.2-preview (in the repository, not yet in the release files)
+## What is new in VGeo 0.15.0-preview (last standalone release)
+
+- **Renamed: UNanite is now VGeo.** Namespace `VGeo`, menus **Tools > VGeo**, package `com.vgeo.virtualgeometry`,
+  plugin folder `Assets/VGeo`. The data format and the asset GUIDs did not change, so the old scenes and `.vgmesh`
+  assets still work. In your scripts replace `using UNanite;` with `using VGeo;`.
+- **URP 17 (RenderGraph) support.** The full visibility buffer path works on URP too: occlusion culling, software
+  raster and URP/Lit materials resolved in URP's own GBuffer and forward passes. There is also a VGeo shadow raster
+  for URP Lit / Simple Lit / Complex Lit, and runtime conversion of renderers and LODGroups.
+- HDRP: cached sun clipmap pages don't draw the whole terrain again every frame (clipmap raster 1.05 -> 0.01 ms in
+  the quarry), and the editor Play Mode has fewer hitches. Android builds no longer log build step errors.
+- All the details are in the [release notes](https://github.com/anomal3/UNanite-Demo/releases).
+
+After this release VGeo continued inside PURR: Meta Quest 2 / 3 support, sun shadows from the VGeo clipmap on
+URP, ray tracing with VGeo proxies, and PURR/Lit materials. See the
+[forum post](https://discussions.unity.com/t/im-tired-of-putting-up-with-this-or-unanite-virtual-mesh-geometry/1737535/48).
+
+## What is new in 0.13.2-preview
 
 - **Scene Setup window** - **Tools > UNanite > Scene Setup**. It scans all open scenes and shows every renderer:
   is it already virtual geometry, can it be converted, or why it stay a regular Unity renderer (skinned mesh, coarser
@@ -90,7 +113,7 @@ In scenes that already have good LODs the difference is much smaller.
 - **Fix for Unity 6 Mesh LOD.** When a model is imported with the automatic Mesh LOD of Unity 6, UNanite built all its
   LODs on top of each other. Now it takes only LOD0.
 - **Fix for terrain shadows.** Big false shadows on sunny hills of virtual geometry terrain are gone.
-- **New sample: Quarry Scene** (`Assets/UNanite/Samples~/QuarryScene`, HDRP). It imports a folder of Megascans
+- **New sample: Quarry Scene** (`Assets/VGeo/Samples~/QuarryScene`, HDRP). It imports a folder of Megascans
   downloads from Fab (the zip files like you download them) and builds a big slate quarry from them: rock faces on
   the walls, scree, boulders, bushes and grass, a brick ruin, a worker camp. Press **V** to compare with Unity
   rendering, **P** for a fly-through. I make it with 57 free Fab assets: 9 246 objects and 249 million triangles.
@@ -144,18 +167,20 @@ In scenes that already have good LODs the difference is much smaller.
 - Destruction: the mesh is fractured on import, every piece is also virtual geometry
 - Player builds on Windows / DirectX 12
 
-**Not yet:** skinned meshes (the character in the demo is regular Unity), full URP support (only basic), mobile,
-Vulkan and AMD cards are not tested. I tested it only on RTX 3060, so if you will run it on other hardware please tell me how it goes.
+**Not in the standalone package:** skinned meshes (the character in the demo is regular Unity) and mobile / VR (in
+PURR only). Vulkan and AMD cards were not tested. I tested it only on RTX 3060, so if you will run it on other hardware please tell me how it goes.
 
 ## Plugin in your project
 
-1. Unity 6000.4 with HDRP 17.4.
-2. Import `UNanite_0.11.2-preview.unitypackage`, a welcome window will open (you can switch it off at the bottom).
-3. Open **Tools > UNanite > Scene Setup**: it shows what can be converted. Select the rows and press Convert (or
-   select objects in the scene and use **Tools > UNanite > Convert Selection to Virtual Geometry**).
-4. Press Play. Debug views are in the UNanite overlay of the Scene view.
+1. Unity 6000.4 with HDRP 17.4 or URP 17.4.
+2. Import `VGeo_0.15.0-preview.unitypackage`, a welcome window will open (you can switch it off at the bottom).
+   Coming from UNanite: delete `Assets/UNanite` first (the GUIDs are the same, your scenes keep their references) and
+   replace `using UNanite;` with `using VGeo;` in your scripts.
+3. Open **Tools > VGeo > Scene Setup**: it shows what can be converted. Select the rows and press Convert (or
+   select objects in the scene and use **Tools > VGeo > Convert Selection to Virtual Geometry**).
+4. Press Play. Debug views are in the VGeo overlay of the Scene view.
 
-More details are in the PDF on the Releases page. How the geometry data is stored (clusters, pages, compression):
+The plugin README is in `Assets/VGeo/README.md`, the old PDF manual (0.11.2) is on the Releases page. How the geometry data is stored (clusters, pages, compression):
 [Docs/DataFormat.md](Docs/DataFormat.md).
 
 ## About me and the project
@@ -164,9 +189,11 @@ I am one developer and I make UNanite alone, in my free time after work. I am wo
 first was the cluster hierarchy and GPU culling, then the visibility buffer, shadows and streaming, last month I add
 terrain, foliage and destruction. After that I tried **virtual shadow maps** (cached paged shadows, like in Unreal).
 I expected that they will make shadows much cheaper, but in my tests the gain was not there (see "What is new"), so
-for now they stay an experiment. When the next version will be ready, I will post it here.
+for now they stay an experiment.
 
-If you find a bug or have a scene where UNanite works bad, please open an issue, it helps a lot.
+In September 2026 UNanite was renamed to VGeo and moved into my render pipeline forks (PHRR for HDRP, then PURR for
+URP). This was the last standalone version, and all new work goes to PURR. Please report bugs and ask questions on
+[Discord](https://discord.gg/VcmZjXuPRb).
 
 ## Support the project
 
@@ -176,18 +203,18 @@ If you decide to support the project and the future of this Nanite system, you c
 
 <img src="Docs/images/donate_usdt_qr.jpg" width="260" alt="USDT TRC-20 QR code">
 
-Thank you, every support really helps to find more time for UNanite!
+Thank you, every support really helps to find more time for VGeo and PURR!
 
 ## License
 
-UNanite is free and open source: **GPL-3.0 with a Unity exception**. You can use it in any project - free or paid,
-open or closed source, your own game code stays yours. What I ask in return:
+VGeo (formerly UNanite) is free and open source: **GPL-3.0 with a Unity exception**. You can use it in any project -
+free or paid, open or closed source, your own game code stays yours. What I ask in return:
 
-- UNanite itself and every changed version of it stays open (GPL-3.0, with the source);
-- keep the credit **"UNanite by Roman Koscheev (anomal3)"** in your credits or about screen;
-- don't present it as your own work and don't call your own version "UNanite".
+- VGeo itself and every changed version of it stays open (GPL-3.0, with the source);
+- keep the credit **"VGeo by Roman Koscheev (anomal3)"** in your credits or about screen;
+- don't present it as your own work and don't call your own version "VGeo" (or "UNanite").
 
-Details in [LICENSE.md](LICENSE.md) and [NOTICE.md](Assets/UNanite/NOTICE.md).
+Details in [LICENSE.md](LICENSE.md) and [NOTICE.md](Assets/VGeo/NOTICE.md).
 
 ## Credits
 
